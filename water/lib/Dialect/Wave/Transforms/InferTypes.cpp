@@ -17,11 +17,13 @@
 #include "water/Dialect/Wave/IR/WaveDialect.h"
 #include "water/Dialect/Wave/IR/WaveInterfaces.h"
 #include "water/Dialect/Wave/IR/WaveOps.h"
+#include "water/Dialect/Wave/IR/WaveUtils.h"
 #include "water/Dialect/Wave/Transforms/DataFlowAnalyses.h"
 #include "water/Dialect/Wave/Transforms/Passes.h"
 #include "water/Dialect/Wave/Transforms/Utils.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -296,10 +298,10 @@ public:
     return success();
   }
 
-  void visitNonControlFlowArguments(Operation *op,
-                                    const RegionSuccessor &successor,
-                                    llvm::ArrayRef<InferTypeLattice *> lattices,
-                                    unsigned firstIndex) override {
+  void visitNonControlFlowArguments(
+      Operation *op, const RegionSuccessor &successor,
+      ValueRange nonSuccessorInputs,
+      llvm::ArrayRef<InferTypeLattice *> lattices) override {
     auto iterateOp = llvm::dyn_cast<wave::IterateOp>(op);
     if (!iterateOp)
       return;
@@ -307,8 +309,6 @@ public:
     // Technically, the non-captured arguments can be seen as forwarded from
     // operands or results, but they need special handling to remove
     // loop-specific parts of the index.
-    assert(firstIndex == 0 &&
-           "expected all arguments to be marked as non-control flow");
     assert((successor.isParent() ||
             successor.getSuccessor()->getRegionNumber() == 0) &&
            "unexpected control flow");
@@ -321,7 +321,7 @@ public:
       for (auto &&[terminatorOperand, iterArg, lattice] : llvm::zip_equal(
                yieldOp.getOperands(), iterateOp.getIterArgs(),
                lattices.take_front(iterateOp.getIterArgs().size()))) {
-        // Fetch the lattice and create a dependecy to re-visit the program
+        // Fetch the lattice and create a dependency to re-visit the program
         // point at the start of the loop body block when the lattice changes
         // since we know we are processing a branch into the loop body. Taking
         // the program point before the block / first operation will call
@@ -423,6 +423,11 @@ public:
       return failure();
 
     top->walk([this](Operation *op) {
+      // Enable "sideways" propagation between operands for ops that require it.
+      if (op->hasTrait<wave::RequiresSidewaysBackwardPropagationOpTrait>())
+        for (Value operand : op->getOperands())
+          addDependency(getLatticeElement(operand), getProgramPointAfter(op));
+
       if (!op->hasTrait<OpTrait::ReturnLike>())
         return;
       if (!llvm::isa<FunctionOpInterface>(op->getParentOp()))
@@ -617,6 +622,39 @@ updateValueTypes(Operation *root,
 }
 
 namespace {
+// Wrapper to print operations without regions. Use as `llvm::outs() <<
+// PrintNoRegions(op)`.
+class PrintNoRegions {
+public:
+  PrintNoRegions(Operation *op) : operation(op) {}
+
+  void print(llvm::raw_ostream &os) const {
+    if (!operation) {
+      os << "<null>";
+      return;
+    }
+    operation->print(os, OpPrintingFlags().skipRegions());
+  }
+
+private:
+  Operation *operation;
+};
+} // namespace
+
+// Support operator<< for PrintNoRegions.
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const PrintNoRegions &printer) {
+  printer.print(os);
+  return os;
+}
+
+inline llvm::raw_ostream &
+operator<<(llvm::raw_ostream &os, const ElementsPerThreadLatticeValue &value) {
+  value.print(os);
+  return os;
+}
+
+namespace {
 // Type inference pass implementation.
 class InferTypes : public wave::impl::WaterWaveInferTypesPassBase<InferTypes> {
 public:
@@ -667,10 +705,21 @@ public:
     if (llvm::failed(updateValueTypes(getOperation(), updateType)))
       return signalPassFailure();
 
-    llvm::LogicalResult result = setNormalFormPassPostcondition(
-        wave::WaveNormalForm::AllTypesSpecified, getOperation());
-    if (llvm::failed(result) && !force)
+    WalkResult walkResult =
+        getOperation()->walk([&](wave::WaveInferTypeOpInterface iface) {
+          if (failed(iface.finalizeTypeInference()))
+            return WalkResult::interrupt();
+          return WalkResult::advance();
+        });
+    if (walkResult.wasInterrupted())
       return signalPassFailure();
+
+    if (!partial) {
+      llvm::LogicalResult result = setNormalFormPassPostcondition(
+          wave::WaveNormalForm::AllTypesSpecified, getOperation());
+      if (llvm::failed(result) && !force)
+        return signalPassFailure();
+    }
   }
 };
 
@@ -722,7 +771,9 @@ handleNonInterfaceOpElementsPerThread(Operation *op) {
 class ElementsPerThreadForwardAnalysis
     : public dataflow::SparseForwardDataFlowAnalysis<ElementsPerThreadLattice> {
 public:
-  using SparseForwardDataFlowAnalysis::SparseForwardDataFlowAnalysis;
+  ElementsPerThreadForwardAnalysis(DataFlowSolver &solver,
+                                   const wave::ElementsPerThreadInit &init)
+      : SparseForwardDataFlowAnalysis(solver), init(init) {}
 
   // Basic initialization and configuration filtering.
   LogicalResult initialize(Operation *top) override {
@@ -735,7 +786,105 @@ public:
     if (failed(AbstractSparseForwardDataFlowAnalysis::initialize(top)))
       return failure();
 
-    return success();
+    WalkResult walkResult = top->walk([&](Operation *op) {
+      auto indexArray = op->getAttrOfType<ArrayAttr>(
+          wave::WaveDialect::kIndexWaveExprListAttrName);
+      if (!indexArray)
+        return WalkResult::advance();
+
+      auto indexIface = dyn_cast<wave::WaveInferIndexExprsOpInterface>(op);
+      if (!indexIface)
+        return WalkResult::advance();
+
+      SmallVector<Value> valuesForIndexExpr;
+      std::function<void(raw_ostream &, unsigned)> descriptionGenerator =
+          indexIface.getIndexExprValuesAndDescriptions(valuesForIndexExpr);
+
+      assert(valuesForIndexExpr.size() == indexArray.size());
+      for (auto [i, value, index] :
+           llvm::enumerate(valuesForIndexExpr, indexArray)) {
+        ElementsPerThreadLattice *lattice = getLatticeElement(value);
+        auto indexDict = cast<DictionaryAttr>(index);
+        std::optional<int64_t> elementsPerThread = std::nullopt;
+        llvm::StringSet<> visitedSymbols;
+        for (const NamedAttribute &namedAttr : indexDict) {
+          visitedSymbols.insert(namedAttr.getName().strref());
+          auto mapping = cast<wave::WaveIndexMappingAttr>(namedAttr.getValue());
+          ArrayRef<Attribute> symbols = mapping.getSymbols();
+          AffineMap step = mapping.getStep();
+          if (!step)
+            continue;
+          std::optional<SmallVector<int64_t>> stepValues =
+              wave::evaluateMapWithHyperparams(step, symbols, init.hyperparams);
+          if (!stepValues)
+            continue;
+          // TODO(#1012): turn this into an assertion when the verifier is
+          // implemented.
+          int64_t stepValue = (*stepValues)[0];
+          if (stepValue <= 0) {
+            op->emitError() << "expected positive step in index expressions "
+                               "(missing verifier)";
+            return WalkResult::interrupt();
+          }
+
+          // Elements per thread may be 1 if _all_ dimensions have a unit step,
+          // otherwise it should be the one non-unit step.
+          // TODO(#1013): this logic can be reused in the verifier.
+          if (!elementsPerThread.has_value()) {
+            elementsPerThread = (*stepValues)[0];
+          } else if (*elementsPerThread == 1) {
+            elementsPerThread = (*stepValues)[0];
+          } else if (stepValue != 1) {
+            // TODO(#1013): turn this into an assertion when the verifier is
+            // implemented.
+            op->emitError() << "expected only one non-unit index step, found "
+                            << (*stepValues)[0] << " and " << *elementsPerThread
+                            << " (missing verifier)";
+            return WalkResult::interrupt();
+          }
+        }
+
+        llvm::SmallString<32> description;
+        llvm::raw_svector_ostream descriptionOs(description);
+        descriptionGenerator(descriptionOs, i);
+        auto resultType = cast<wave::WaveTensorType>(value.getType());
+        if (!llvm::all_of(resultType.getShape(), [&](wave::WaveSymbolAttr dim) {
+              return visitedSymbols.contains(dim.getName());
+            })) {
+          // TODO(#878): turn this into an assertion when the verifier is
+          // implemented. We may also consider a relaxation where we take the
+          // non-unit EPT if it was extracted even from an incomplete index
+          // expression.
+          op->emitError() << "expected index to contain entries for all "
+                          << description << " dimensions (missing verifier)";
+          return WalkResult::interrupt();
+        }
+
+        // If couldn't get a fixed value for EPT, bail.
+        if (!elementsPerThread.has_value()) {
+          return WalkResult::advance();
+        }
+
+        std::string errorMessage;
+        llvm::raw_string_ostream errs(errorMessage);
+        FailureOr<ChangeResult> result =
+            wave::detail::checkAndPropagateElementsPerThreadFromConstant(
+                wave::ElementsPerThreadLatticeValue(*elementsPerThread), {},
+                lattice->getValue(), "index expression", "",
+                descriptionOs.str(), errs);
+        if (failed(result)) {
+          op->emitError() << "failed to propagate elements per thread forward "
+                             "during initialization: "
+                          << errs.str();
+          return WalkResult::interrupt();
+        }
+        if (*result == ChangeResult::Change)
+          propagateIfChanged(lattice, *result);
+      }
+      return WalkResult::advance();
+    });
+
+    return success(!walkResult.wasInterrupted());
   }
 
   // Called by base class initialization and when the analysis fails to identify
@@ -767,17 +916,34 @@ public:
     llvm::SmallVector<ElementsPerThreadLatticeValue> resultElements =
         llvm::map_to_vector(results, extractValue);
 
+    LLVM_DEBUG({
+      LDBG() << "visiting operation forward " << PrintNoRegions(op);
+      LDBG() << "  operand elements:";
+      for (auto [i, operand] : llvm::enumerate(operandElements)) {
+        LDBG() << "    operand #" << i << ": " << operand;
+      }
+      LDBG() << "  result elements:";
+      for (auto [i, result] : llvm::enumerate(resultElements)) {
+        LDBG() << "    result #" << i << ": " << result;
+      }
+    });
     std::string errorMessage;
     llvm::raw_string_ostream errs(errorMessage);
     llvm::FailureOr<ChangeResult> result =
         llvm::cast<wave::WaveElementsPerThreadOpInterface>(op)
             .propagateElementsPerThreadForward(operandElements, resultElements,
-                                               errs);
+                                               errs, init);
     if (llvm::failed(result)) {
       return op->emitError()
              << "failed to propagate elements per thread forward: "
              << errs.str();
     }
+    LLVM_DEBUG({
+      LDBG() << "  updated result elements:";
+      for (auto [i, result] : llvm::enumerate(resultElements)) {
+        LDBG() << "    result #" << i << ": " << result;
+      }
+    });
     if (*result == ChangeResult::NoChange)
       return success();
 
@@ -790,8 +956,8 @@ public:
 
   void visitNonControlFlowArguments(
       Operation *op, const RegionSuccessor &successor,
-      llvm::ArrayRef<ElementsPerThreadLattice *> lattices,
-      unsigned firstIndex) override {
+      ValueRange nonSuccessorInputs,
+      llvm::ArrayRef<ElementsPerThreadLattice *> lattices) override {
     auto iterateOp = llvm::dyn_cast<wave::IterateOp>(op);
     if (!iterateOp)
       return;
@@ -799,8 +965,6 @@ public:
     // Technically, the non-captured arguments can be seen as forwarded from
     // operands or results, but they need special handling to remove
     // loop-specific parts of the index.
-    assert(firstIndex == 0 &&
-           "expected all arguments to be marked as non-control flow");
     assert((successor.isParent() ||
             successor.getSuccessor()->getRegionNumber() == 0) &&
            "unexpected control flow");
@@ -849,6 +1013,9 @@ public:
       }
     }
   }
+
+private:
+  wave::ElementsPerThreadInit init;
 };
 
 // Dataflow analysis propagating elements-per-thread information from results
@@ -870,7 +1037,10 @@ class ElementsPerThreadBackwardAnalysis
     : public dataflow::SparseBackwardDataFlowAnalysis<
           ElementsPerThreadLattice> {
 public:
-  using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
+  ElementsPerThreadBackwardAnalysis(DataFlowSolver &solver,
+                                    SymbolTableCollection &symbolTable,
+                                    const wave::ElementsPerThreadInit &init)
+      : SparseBackwardDataFlowAnalysis(solver, symbolTable), init(init) {}
 
   // Basic initialization and configuration filtering.
   LogicalResult initialize(Operation *top) override {
@@ -879,6 +1049,16 @@ public:
 
     if (failed(SparseBackwardDataFlowAnalysis::initialize(top)))
       return failure();
+
+    // Enable "sideways" propagation between operands for ops that require it.
+    top->walk([&](Operation *op) {
+      if (!op->hasTrait<wave::RequiresSidewaysBackwardPropagationOpTrait>())
+        return WalkResult::advance();
+
+      for (Value operand : op->getOperands())
+        addDependency(getLatticeElement(operand), getProgramPointAfter(op));
+      return WalkResult::advance();
+    });
 
     return success();
   }
@@ -967,17 +1147,34 @@ public:
     llvm::SmallVector<ElementsPerThreadLatticeValue> resultElements =
         llvm::map_to_vector(results, extractValue);
 
+    LLVM_DEBUG({
+      LDBG() << "visiting operation backward " << PrintNoRegions(op);
+      LDBG() << "  operand elements:";
+      for (auto [i, operand] : llvm::enumerate(operandElements)) {
+        LDBG() << "    operand #" << i << ": " << operand;
+      }
+      LDBG() << "  result elements:";
+      for (auto [i, result] : llvm::enumerate(resultElements)) {
+        LDBG() << "    result #" << i << ": " << result;
+      }
+    });
     std::string errorMessage;
     llvm::raw_string_ostream errs(errorMessage);
     llvm::FailureOr<ChangeResult> result =
         llvm::cast<wave::WaveElementsPerThreadOpInterface>(op)
             .propagateElementsPerThreadBackward(operandElements, resultElements,
-                                                errs);
+                                                errs, init);
     if (llvm::failed(result)) {
       return op->emitError()
              << "failed to propagate elements per thread backward: "
              << errs.str();
     }
+    LLVM_DEBUG({
+      LDBG() << "  updated operand elements:";
+      for (auto [i, operand] : llvm::enumerate(operandElements)) {
+        LDBG() << "    operand #" << i << ": " << operand;
+      }
+    });
     if (*result == ChangeResult::NoChange)
       return llvm::success();
 
@@ -997,6 +1194,9 @@ public:
     // This is called for induction variables of an IterateOp, which is handled
     // by the forward analysis.
   }
+
+private:
+  wave::ElementsPerThreadInit init;
 };
 
 // Elements-per-thread propagation pass implementation.
@@ -1008,48 +1208,78 @@ public:
       WaterWavePropagateElementsPerThreadPassBase;
 
   void runOnOperation() override {
-    // Configure the analyses. The dead code and SCP analyses are required by
-    // the logic of the solver currently.
-    SymbolTableCollection symbolTable;
-    DataFlowConfig dataFlowConfig;
-    dataFlowConfig.setInterprocedural(false);
-    DataFlowSolver solver(dataFlowConfig);
-    solver.load<dataflow::DeadCodeAnalysis>();
-    solver.load<dataflow::SparseConstantPropagation>();
-    solver.load<ElementsPerThreadForwardAnalysis>();
-    solver.load<ElementsPerThreadBackwardAnalysis>(symbolTable);
-
-    if (llvm::failed(
-            wave::runSolverAndCaptureErrors(solver, getOperation(), false)))
+    if (failed(wave::verifyNormalFormPassPrecondition(
+            wave::WaveNormalForm::AllTypesSpecified, getOperation(),
+            getArgument())))
       return signalPassFailure();
 
-    auto updateType = [&](Value value, llvm::StringRef description) {
-      auto tensorType = llvm::dyn_cast<wave::WaveTensorType>(value.getType());
-      if (!tensorType ||
-          tensorType.getAddressSpaceValue() != wave::WaveAddressSpace::Register)
+    llvm::DenseMap<Operation *, Attribute> constraints;
+    if (failed(wave::collectWaveConstraints(getOperation(), constraints)))
+      return signalPassFailure();
+
+    // TODO: consider generalizing this logic with other passes.
+    for (auto &&[parent, attr] : constraints) {
+
+      wave::ElementsPerThreadInit init;
+      init.threadXDimension = nullptr;
+      init.hyperparams = wave::getHyperparameters(parent);
+      for (Attribute constraint : cast<ArrayAttr>(attr)) {
+        auto workgroupConstraint =
+            dyn_cast<wave::WorkgroupConstraintAttr>(constraint);
+        if (!workgroupConstraint)
+          continue;
+        if (workgroupConstraint.getWorkgroupDim().getValue() !=
+            wave::WaveWorkgroupDim::X)
+          continue;
+        assert(!init.threadXDimension &&
+               "expected only one dimension to be mapped to workgroup x");
+        init.threadXDimension = workgroupConstraint.getDim();
+      }
+
+      // Configure the analyses. The dead code and SCP analyses are required by
+      // the logic of the solver currently.
+      SymbolTableCollection symbolTable;
+      DataFlowConfig dataFlowConfig;
+      dataFlowConfig.setInterprocedural(false);
+      DataFlowSolver solver(dataFlowConfig);
+      solver.load<dataflow::DeadCodeAnalysis>();
+      solver.load<dataflow::SparseConstantPropagation>();
+      solver.load<ElementsPerThreadForwardAnalysis>(init);
+      solver.load<ElementsPerThreadBackwardAnalysis>(symbolTable, init);
+
+      if (llvm::failed(wave::runSolverAndCaptureErrors(solver, parent, false)))
+        return signalPassFailure();
+
+      auto updateType = [&](Value value, llvm::StringRef description) {
+        auto tensorType = llvm::dyn_cast<wave::WaveTensorType>(value.getType());
+        if (!tensorType || tensorType.getAddressSpaceValue() !=
+                               wave::WaveAddressSpace::Register)
+          return llvm::success();
+
+        const auto *lattice =
+            solver.lookupState<ElementsPerThreadLattice>(value);
+        if (!lattice || lattice->getValue().isBottom()) {
+          emitError(value.getLoc())
+              << "couldn't identify elements per thread for " << description;
+          return llvm::failure();
+        }
+        if (lattice->getValue().isTop()) {
+          emitError(value.getLoc())
+              << "elements per thread conflict was detected for "
+              << description;
+          return llvm::failure();
+        }
+
+        auto vectorType = VectorType::get(
+            {static_cast<int64_t>(lattice->getValue().getValue())},
+            tensorType.getElementType());
+        value.setType(vectorType);
         return llvm::success();
+      };
 
-      const auto *lattice = solver.lookupState<ElementsPerThreadLattice>(value);
-      if (!lattice || lattice->getValue().isBottom()) {
-        emitError(value.getLoc())
-            << "couldn't identify elements per thread for " << description;
-        return llvm::failure();
-      }
-      if (lattice->getValue().isTop()) {
-        emitError(value.getLoc())
-            << "elements per thread conflict was detected for " << description;
-        return llvm::failure();
-      }
-
-      auto vectorType = VectorType::get(
-          {static_cast<int64_t>(lattice->getValue().getValue())},
-          tensorType.getElementType());
-      value.setType(vectorType);
-      return llvm::success();
-    };
-
-    if (llvm::failed(updateValueTypes(getOperation(), updateType)))
-      return signalPassFailure();
+      if (llvm::failed(updateValueTypes(parent, updateType)))
+        return signalPassFailure();
+    }
 
     if (llvm::failed(wave::setNormalFormPassPostcondition(
             wave::WaveNormalForm::MemoryOnlyTypes, getOperation())))
@@ -1065,34 +1295,6 @@ public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IndexExprsLattice);
   using Lattice::Lattice;
 };
-
-namespace {
-// Wrapper to print operations without regions. Use as `llvm::outs() <<
-// PrintNoRegions(op)`.
-class PrintNoRegions {
-public:
-  PrintNoRegions(Operation *op) : operation(op) {}
-
-  void print(llvm::raw_ostream &os) const {
-    if (!operation) {
-      os << "<null>";
-      return;
-    }
-    operation->print(os, OpPrintingFlags().skipRegions());
-  }
-
-private:
-  Operation *operation;
-};
-
-} // namespace
-
-// Support operator<< for OperationPrinterWithoutRegions.
-inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                                     const PrintNoRegions &printer) {
-  printer.print(os);
-  return os;
-}
 
 class IndexExprsForwardAnalysis
     : public dataflow::SparseForwardDataFlowAnalysis<IndexExprsLattice> {
@@ -1126,8 +1328,10 @@ public:
       return llvm::failure();
 
     for (auto &&[parent, attr] : constraints) {
-      auto initObject =
-          wave::IndexExprsAnalysisInit::create(parent->getLoc(), attr);
+      wave::WaveHyperparameterAttr hyperparams =
+          wave::getHyperparameters(parent);
+      auto initObject = wave::IndexExprsAnalysisInit::create(parent->getLoc(),
+                                                             attr, hyperparams);
       if (llvm::failed(initObject))
         return llvm::failure();
       WalkResult walkResult = parent->walk([&](Operation *op) -> WalkResult {
@@ -1317,10 +1521,10 @@ public:
     return llvm::success();
   }
 
-  void
-  visitNonControlFlowArguments(Operation *op, const RegionSuccessor &successor,
-                               llvm::ArrayRef<IndexExprsLattice *> lattices,
-                               unsigned firstIndex) override {
+  void visitNonControlFlowArguments(
+      Operation *op, const RegionSuccessor &successor,
+      ValueRange nonSuccessorInputs,
+      llvm::ArrayRef<IndexExprsLattice *> lattices) override {
     auto iterateOp = llvm::dyn_cast<wave::IterateOp>(op);
     if (!iterateOp)
       return;
@@ -1328,8 +1532,6 @@ public:
     // Technically, the non-captured arguments can be seen as forwarded from
     // operands or results, but they need special handling to remove
     // loop-specific parts of the index.
-    assert(firstIndex == 0 &&
-           "expected all arguments to be marked as non-control flow");
     assert((successor.isParent() ||
             successor.getSuccessor()->getRegionNumber() == 0) &&
            "unexpected control flow");
@@ -1442,14 +1644,15 @@ public:
     if (llvm::failed(wave::collectWaveConstraints(top, constraints)))
       return llvm::failure();
     for (auto &&[parent, attr] : constraints) {
-      auto initObject =
-          wave::IndexExprsAnalysisInit::create(parent->getLoc(), attr);
+      wave::WaveHyperparameterAttr hyperparams =
+          wave::getHyperparameters(parent);
+      auto initObject = wave::IndexExprsAnalysisInit::create(parent->getLoc(),
+                                                             attr, hyperparams);
       if (llvm::failed(initObject))
         return llvm::failure();
 
       parent->walk([&](Operation *op) -> WalkResult {
-        if (op->hasTrait<
-                wave::RequiresIndexExprsSidewaysBackwardPropagationOpTrait>()) {
+        if (op->hasTrait<wave::RequiresSidewaysBackwardPropagationOpTrait>()) {
           for (Value operand : op->getOperands())
             addDependency(getLatticeElement(operand), getProgramPointAfter(op));
         }
@@ -1741,13 +1944,23 @@ wave::setWaveIndexExprAnalysisResults(Operation *top,
           return latticeObject ? latticeObject->getValue()
                                : IndexExprsLatticeStorage::bottom();
         };
-        llvm::SmallVector<wave::IndexExprsLatticeStorage> operandExprs =
-            llvm::map_to_vector(iface->getOperands(), getLatticeValue);
-        llvm::SmallVector<wave::IndexExprsLatticeStorage> resultExprs =
-            llvm::map_to_vector(iface->getResults(), getLatticeValue);
 
-        if (llvm::failed(iface.setIndexFromLattices(operandExprs, resultExprs)))
-          return WalkResult::interrupt();
+        SmallVector<Value> valuesForIndexExpr;
+        std::function<void(raw_ostream &, unsigned)> descriptionGenerator =
+            iface.getIndexExprValuesAndDescriptions(valuesForIndexExpr);
+        SmallVector<Attribute> indexExprs;
+        indexExprs.reserve(valuesForIndexExpr.size());
+        for (auto &&[i, value] : llvm::enumerate(valuesForIndexExpr)) {
+          llvm::SmallString<32> description;
+          llvm::raw_svector_ostream os(description);
+          descriptionGenerator(os, i);
+          if (failed(detail::checkAndAppendIndexExpr(iface->getLoc(),
+                                                     getLatticeValue(value),
+                                                     os.str(), indexExprs)))
+            return WalkResult::interrupt();
+        }
+        iface->setAttr(wave::WaveDialect::kIndexWaveExprListAttrName,
+                       ArrayAttr::get(iface->getContext(), indexExprs));
 
         return WalkResult::advance();
       });

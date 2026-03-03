@@ -100,6 +100,47 @@ class BinaryWaveOp<string mnemonic>
     "functional-type(operands, results)";
 }
 
+class ReductionWaveOp<string mnemonic>
+    : WaveOp<mnemonic,
+        [WaveInferTypeOpInterface, ReductionTypeInferenceOpTrait,
+         WaveElementsPerThreadOpInterface, ReductionElementsPerThreadOpTrait,
+         RequiresSidewaysBackwardPropagationOpTrait, WaveReductionOpTrait]>,
+      WaveArithmeticOpDoc {
+  let arguments = !con((ins
+    Arg<WaveTensorInRegister, "Input tensor to reduce">:$input,
+    Arg<WaveTensorInRegister, "Initial value for the reduction">:$init,
+    Arg<WaveReductionScopeAttr, "Scope of the reduction">:$scope,
+    Arg<OptionalAttr<WaveSymbolAttr>, "Reduction axis">:$axis
+  ), commonArguments);
+
+  let results = (outs
+    Res<WaveTensorInRegister, "Reduced result">:$result
+  );
+
+  let assemblyFormat =
+      "$input `init` `(` $init `)` (`along` custom<SingleSymbol>($axis)^)? "
+      "$scope " # commonArgumentsSyntax # " attr-dict `:`"
+      "functional-type(operands, results)";
+}
+
+def SumOp : ReductionWaveOp<"sum"> {
+  let summary = "Reduce a tensor by summing along a specified axis";
+  let description = [{
+    Reduces the input tensor by summing its elements along the specified
+    symbolic axis. The initial value is used as the starting point for the
+    reduction.
+  }] # baseDescription;
+}
+
+def MaxElementOp : ReductionWaveOp<"max_element"> {
+  let summary = "Reduce a tensor by taking the maximum along a specified axis";
+  let description = [{
+    Reduces the input tensor by taking the maximum of its elements along the
+    specified symbolic axis. The initial value is used as the starting point
+    for the reduction.
+  }] # baseDescription;
+}
+
 //-----------------------------------------------------------------------------
 // Arithmetic operations
 //-----------------------------------------------------------------------------
@@ -124,6 +165,16 @@ def DivOp : BinaryWaveOp<"div"> {
   let description = baseDescription;
 }
 
+def MaxOp : BinaryWaveOp<"max"> {
+  let summary = "Get the maximum of two values";
+  let description = baseDescription;
+}
+
+def MinOp : BinaryWaveOp<"min"> {
+  let summary = "Get the minimum of two values";
+  let description = baseDescription;
+}
+
 def Exp2Op : UnaryWaveOp<"exp2"> {
   let summary = "Compute 2 to the power of the argument";
   let description = baseDescription;
@@ -135,11 +186,35 @@ def ReciprocalOp : UnaryWaveOp<"reciprocal"> {
   let hasVerifier = 1;
 }
 
+def SelectOp : WaveOp<"select",
+    [WaveInferTypeOpInterface, IdentityTypeInferenceOpTrait,
+     WaveElementsPerThreadOpInterface, IdentityElementsPerThreadOpTrait,
+     WaveInferIndexExprsOpInterface, IdentityIndexExprsOpTrait]> {
+  let summary = "Select between two values based on a condition";
+  let description = [{
+    Selects between two values based on a condition. The selection is element-wise, that is,
+    the condition is a tensor co-indexed with the two values.
+  }];
+  let arguments = !con((ins
+    Arg<WaveTensorInRegister, "Condition">:$condition,
+    Arg<WaveTensorInRegister, "First value">:$lhs,
+    Arg<WaveTensorInRegister, "Second value">:$rhs
+  ), commonArguments);
+  let results = (outs
+    Res<WaveTensorInRegister, "Result">:$result
+  );
+  let assemblyFormat =
+    "$condition `,` $lhs `,` $rhs " # commonArgumentsSyntax # "attr-dict `:` "
+    "functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def MmaOp : WaveOp<"mma",
     [DeclareOpInterfaceMethods<WaveInferTypeOpInterface>,
      DeclareOpInterfaceMethods<WaveElementsPerThreadOpInterface>,
      DeclareOpInterfaceMethods<WaveInferIndexExprsOpInterface,
-      ["initializeIndexExprsForward", "initializeIndexExprsBackward"]>]>,
+      ["initializeIndexExprsForward", "initializeIndexExprsBackward",
+       "getIndexExprValuesAndDescriptions"]>]>,
             WaveArithmeticOpDoc {
   let summary = "Matrix multiply and accumulate";
 
@@ -278,8 +353,16 @@ def AllocateOp : WaveOp<"allocate", [
 
   let arguments = !con((ins
     Arg<Optional<WaveMemoryType>, "Optional parent buffer to view into">:$parent,
-    Arg<WaveExprListAttr, "Distributed (physical) shape">:$distributed_shape,
-    Arg<OptionalAttr<I64Attr>, "Byte offset into parent buffer">:$offset
+    Arg<WaveExprListAttrOf<[WaveSymbolAttr]>,
+        "Distributed (physical) shape">:$distributed_shape,
+    Arg<OptionalAttr<I64Attr>, "Byte offset into parent buffer">:$offset,
+    Arg<DefaultValuedAttr<ConfinedAttr<I64Attr, [IntMinValue<0>]>, "0">,
+      "Padding added to the last dimension of distributed shape in number of elements">:$padding,
+    Arg<OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<0>]>>, [{
+      Padding added to the end of an allocation in number of elements,
+      does not affect the distributed shape
+    }]
+    >:$tail_padding
   ), commonArguments);
 
   let results = (outs Res<WaveMemoryType, "Allocated buffer">:$result);
@@ -290,23 +373,44 @@ def AllocateOp : WaveOp<"allocate", [
   let hasVerifier = 1;
 }
 
-def ExtractOp : WaveOp<"extract", [WaveInferTypeOpInterface, IdentityTypeInferenceOpTrait, CompatibleOperandsAndResultsOpTrait, NoOpElementsPerThreadOpTrait]> {
+def ExtractOp : WaveOp<"extract",
+    [DeclareOpInterfaceMethods<WaveElementsPerThreadOpInterface>]> {
   let summary = "Extracts a single element from a vector at the given index";
   let description = [{
-    Extracts a single element from a 1-D vector at the specified index position,
-    producing a 1-element vector.
+    This is an internal operation that appears during expansion/lowering and
+    is not intended for use in user code. As such, it intentionally does not
+    implement the interfaces for type and index dataflow analyses as it only
+    appears after those. It does, however, implement the elements per thread
+    interface as it is needed for lowering to vectors. User code should use
+    `extract_slice` instead.
+
+    When lowered, extracts a single element from the vector that corresponds
+    to lowered register-resident tensor, producing a 1-element vector.
+    Therefore, the result tensor is indexed by one less dimension that the
+    source tensor.
+
+    TODO: we don't have a good way of verifying this, but the shape dimension
+    removed from the result must be the only one with non-unit index step
+    (second element of the index expression) when such a
+    symbol exists (and presumably the last / the one mapped to thread X
+    otherwise).
+
+    TODO: this operation leaks the internal abstraction of vector registers.
+    Consider regrouping it with `reshape` into a single relayout operation.
   }];
 
-  let arguments = (ins
+  let arguments = !con((ins
     Arg<WaveTensorInRegister, "Vector to extract from">:$source,
     Arg<WaveExprListAttr, "Index position to extract">:$position
-  );
+  ), commonArguments);
 
   let results = (outs
     Res<WaveTensorInRegister, "Extracted 1-element vector">:$result
   );
 
-  let assemblyFormat = "$source `[` $position `]` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat =
+    "$source `[` $position `]` " # commonArgumentsSyntax # "attr-dict "
+    "`:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 
@@ -320,9 +424,9 @@ def ExtractSliceOp : WaveOp<"extract_slice", [WaveInferTypeOpInterface, Identity
 
   let arguments = (ins
     Arg<WaveTensorInRegister, "Memory to extract slice from">:$memory,
-    Arg<WaveExprListAttr>:$offset,
-    Arg<WaveExprListAttr>:$size,
-    Arg<WaveExprListAttr>:$stride
+    Arg<WaveExprListAttrOf<[WaveSymbolAttr]>>:$offset,
+    Arg<WaveExprListAttrOf<[WaveSymbolAttr]>>:$size,
+    Arg<WaveExprListAttrOf<[WaveSymbolAttr]>>:$stride
   );
 
   let results = (outs
@@ -333,25 +437,94 @@ def ExtractSliceOp : WaveOp<"extract_slice", [WaveInferTypeOpInterface, Identity
   let hasVerifier = 1;
 }
 
+def ReshapeOp : WaveOp<"reshape", [
+    DeclareOpInterfaceMethods<WaveElementsPerThreadOpInterface>]> {
+  let summary = "Reshapes a tensor";
+  let description = [{
+    **CAUTION**: This is a legacy internal operation not expected to be used in
+    the frontend, only to be constructed by the compiler during the transitional
+    period. As such, it does not implement the interfaces for type inference and
+    index propagation as it is expected to only appear after those.
+
+    Changes the vectorized register representation of a tensor to use
+    the vector sized specified in the target vector shape. When register-resident
+    tensors are lowered to vectors, this may become an operation that composes
+    multiple vectors into a single vector.
+
+    This operation is an amalgamation of two distinct cases:
+
+      1. Concat-style reshape creates a tensor with an extra dimension from
+         multiple tensors. This lowers to a concatenation of vectors.
+      2. Split-style reshape extracts a subtensor from a larger tensor and
+         removes one dimension.
+
+    The asymmetry is due to the fact that this operation is intended for 1D
+    vectors obtained from vectorizing a specific dimension. Non-vectorized
+    dimensions are handled by loops or split into multiple operations. When the
+    source doesn't involve the vectorized dimension, it gets produced by
+    repeating the operation and `reshape` thus has multiple operands. When the
+    source involves the vectorized dimension and the result doesn't (or no
+    longer vectorizes the same dimension), the `reshape` itself gets replicated
+    multiple times to produce portions of the result.
+
+    TODO: this operation is tightly connected to `extract`, likely misnamed, and
+    is up for redesign. The usage of `target_vector_shape` of the python
+    equivalent is **inconsistent** and in some cases is used for the _source_
+    vector shape instead in a blatant violation of any reasonable semantic
+    contract (#942). This will **NOT** be modeled here.
+  }];
+
+  let arguments = !con((ins
+    // TODO: cannot use WaveTensorInRegister here because it's not a Type, requires
+    // an upstream change to Variadic to allow TypeConstraint.
+    Arg<Variadic<AnyType>,
+        "Tensor to reshape, potentially composed from a sequence "
+        "of registers">:$source,
+    Arg<DictionaryAttr, "Target vector shape">:$target_vector_shape,
+    Arg<DefaultValuedAttr<
+        ConfinedAttr<I64Attr, [IntMinValue<0>]>, "0">,
+        "Logical slice">:$logical_slice,
+    Arg<DefaultValuedAttr<
+        ConfinedAttr<I64Attr, [IntMinValue<1>]>, "1">,
+        "Number of slices">:$num_slices
+  ), commonArguments);
+
+  let results = (outs
+    Res<WaveTensorInRegister, "Reshaped tensor">:$result
+  );
+
+  let assemblyFormat =
+    "$source" # commonArgumentsSyntax  # "attr-dict `:` "
+    "custom<ReusedType>(type($source), ref($source)) `to` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
 def ReadOp : WaveOp<"read", [
-    WaveInferTypeOpInterface, IdentityTypeInferenceOpTrait,
+    DeclareOpInterfaceMethods<WaveInferTypeOpInterface>,
     DeclareOpInterfaceMethods<WaveElementsPerThreadOpInterface>,
-    CompatibleOperandsAndResultsIgnoreSpaceOpTrait,
     WaveInferIndexExprsOpInterface, IdentityIndexExprsOpTrait]> {
   let summary = "Reads from memory";
   let description = [{
     Moves data from a memory-resident tensor to a register-resident tensor
     preserving the shape.
+
+    If mapping is provided, it indicates how dimensions of the register-resident
+    value tensor map to those of the memory-resident tensor. Currently, this must
+    be a permutation of dimensions such that the symbolic shapes of the tensors
+    match.
   }];
 
   let arguments = !con((ins
     Arg<WaveMemoryType, "Memory to read from">:$memory,
     Arg<OptionalAttr<I64Attr>,
         "Number of elements processed by each thread">:$elements_per_thread,
-    Arg<OptionalAttr<WaveReadWriteBoundsAttr>,
-        "Bound expressions for each symbolic dimension">:$bounds,
+    Arg<OptionalAttr<WaveSymbolMappingToNResultExprListAttr<1>>,
+        "Bound expressions for symbolic dimensions that need masking">:$bounds,
     Arg<OptionalAttr<WaveSymbolArrayAttr>,
-        "Ordered dimension symbols from memory type shape">:$ordered_syms
+        "Ordered dimension symbols from memory type shape">:$ordered_syms,
+    Arg<OptionalAttr<WaveExprListAttr>,
+        "Indicates how value dimensions are remapped into memory dimensions">
+       :$mapping
   ), commonArguments);
 
   let results = (outs
@@ -398,15 +571,20 @@ def RegisterOp : WaveOp<"register", [
 }
 
 def WriteOp : WaveOp<"write", [
-    WaveInferTypeOpInterface, NoOpTypeInferenceOpTrait,
+    DeclareOpInterfaceMethods<WaveInferTypeOpInterface>,
     DeclareOpInterfaceMethods<WaveElementsPerThreadOpInterface>,
-    CompatibleOperandsAndResultsIgnoreSpaceOpTrait,
-    DeclareOpInterfaceMethods<WaveInferIndexExprsOpInterface>,
-    RequiresIndexExprsSidewaysBackwardPropagationOpTrait]> {
+    DeclareOpInterfaceMethods<WaveInferIndexExprsOpInterface,
+        ["getIndexExprValuesAndDescriptions"]>,
+    RequiresSidewaysBackwardPropagationOpTrait]> {
   let summary = "Writes into memory";
   let description = [{
     Moves data from a register-resident tensor into a memory-resident tensor
     preserving the shape.
+
+    If mapping is provided, it indicates how dimensions of the register-resident
+    value tensor map to those of the memory-resident tensor. Currently, this must
+    be a permutation of dimensions such that the symbolic shapes of the tensors
+    match.
   }];
 
   let arguments = !con((ins
@@ -414,10 +592,13 @@ def WriteOp : WaveOp<"write", [
     Arg<WaveMemoryType, "Memory to write into">:$memory,
     Arg<OptionalAttr<I64Attr>,
         "Number of elements processed by each thread">:$elements_per_thread,
-    Arg<OptionalAttr<WaveReadWriteBoundsAttr>,
-        "Bound expressions for each symbolic dimension">:$bounds,
+    Arg<OptionalAttr<WaveSymbolMappingToNResultExprListAttr<1>>,
+        "Bound expressions for symbolic dimensions that need masking">:$bounds,
     Arg<OptionalAttr<WaveSymbolArrayAttr>,
-        "Ordered dimension symbols from memory type shape">:$ordered_syms
+        "Ordered dimension symbols from memory type shape">:$ordered_syms,
+    Arg<OptionalAttr<WaveExprListAttr>,
+        "Indicates how value dimensions are remapped into memory dimensions">
+       :$mapping
   ), commonArguments);
 
   let assemblyFormat =
@@ -481,6 +662,56 @@ def ShuffleOp : WaveOp<"shuffle", [
 // Miscellaneous operations
 //-----------------------------------------------------------------------------
 
+def ApplyExprOp : WaveOp<"apply_expr",
+    [WaveInferTypeOpInterface, IdentityTypeInferenceOpTrait,
+     WaveElementsPerThreadOpInterface, IdentityElementsPerThreadOpTrait,
+     CompatibleOperandsAndResultsShapeOpTrait,
+     WaveInferIndexExprsOpInterface, IdentityIndexExprsOpTrait]>,
+    WaveArithmeticOpDoc {
+  let summary = "Apply a symbolic expression to one or more register values";
+  let description = [{
+    Applies a symbolic expression to one or more register-resident tensor
+    values. The expression is specified as a `WaveExprListAttr` containing an
+    affine map. Symbols in the expression correspond to one of the operands or
+    to an external symbolic constant. An optional `combinator` may be provided
+    to combine multiple results of the affine map together in a non-affine way.
+    If not provided, the map must have a single result. If a comparison
+    combinator is provided, the map must have exactly two results. For min/max
+    combinators, the map must have at least one result.
+
+    All operands must have the same type and indexing dimensions. The result
+    type is the same as the operand types except for comparison combinators
+    where it may be an arbitrary integer type, though only the last bit of
+    this type will be set if the comparison is true.
+
+    TODO(#901): tighten the constraint on comparison result to be i1, which is
+    currently impossible because python typing is broken.
+
+    Operand symbols are represented using `WaveOperandAttr` (`#wave.operand`)
+    with the operand index (0 for first operand, 1 for second, etc.). In
+    expressions they appear as `_Operand_0`, `_Operand_1`, etc. External
+    symbolic constants use `WaveSymbolAttr` (`#wave.symbol`).
+  }] # baseDescription;
+
+  // Accept both WaveTensorType (before PropagateElementsPerThread) and
+  // 1D vectors (after). We cannot use Variadic<WaveTensorInRegister> because
+  // Variadic requires a Type and not a TypeConstraint.
+  let arguments = !con((ins
+    Arg<Variadic<WaveIterableType>, "Input registers">:$arguments,
+    Arg<WaveExprListAttrOf<[WaveSymbolAttr, WaveOperandAttr]>, "Expression to apply">:$expr,
+    Arg<OptionalAttr<WaveApplyExprCombinatorAttr>, "Combinator to apply">:$combinator
+  ), commonArguments);
+
+  let results = (outs
+    Res<WaveTensorInRegister, "Result">:$result
+  );
+
+  let assemblyFormat =
+    "`(` $arguments `)` ($combinator^)? $expr " # commonArgumentsSyntax
+    # "attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def CastOp : WaveOp<"cast", [
     WaveInferTypeOpInterface, IdentityTypeInferenceOpTrait,
     WaveElementsPerThreadOpInterface, IdentityElementsPerThreadOpTrait,
@@ -501,6 +732,119 @@ def CastOp : WaveOp<"cast", [
   let assemblyFormat =
     "$value_to_cast " # commonArgumentsSyntax # " attr-dict `:`"
     "qualified(type($value_to_cast)) `to` qualified(type($result))";
+
+  let hasVerifier = 1;
+}
+
+def BroadcastOp : WaveOp<"broadcast", [
+    WaveInferTypeOpInterface, NoOpTypeInferenceOpTrait,
+    NoOpElementsPerThreadOpTrait,
+    DeclareOpInterfaceMethods<WaveInferIndexExprsOpInterface>]> {
+  let summary = "Broadcast a tensor to a larger shape by replicating values";
+  let description = [{
+    Broadcasts the source tensor to the result shape by replicating values
+    along the broadcast dimensions. This may introduce new dimensions in
+    arbitrary positions but may not change the order of existing dimensions.
+
+    When the result type is a tensor, it must be fully specified; broadcast
+    dimensions are inferred from the difference between the source and result
+    symbolic shapes.
+
+    This operation stops propagation of elements-per-thread as it is not
+    necessarily known which of the indexing dimensions it is associated with.
+    (Operand) type inference is also impossible given the result type only.
+  }];
+
+  let arguments = !con((ins
+    Arg<WaveTensorInRegister, "Source tensor to broadcast">:$source
+  ), commonArguments);
+
+  let results = (outs
+    Res<WaveTensorInRegister, "Broadcasted result">:$result
+  );
+
+  let assemblyFormat =
+    "$source " # commonArgumentsSyntax # " attr-dict `:`"
+    "functional-type(operands, results)";
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    // Infer broadcast dimensions from types. Expects both source and result
+    // types to be fully specified tensor types.
+    ::llvm::SmallVector<::wave::WaveSymbolAttr> inferBroadcastDims();
+  }];
+}
+
+def SelfIndexOp : WaveOp<"self_index", [
+    WaveInferTypeOpInterface, NoOpTypeInferenceOpTrait,
+    NoOpElementsPerThreadOpTrait,
+    WaveInferIndexExprsOpInterface, IdentityIndexExprsOpTrait]> {
+  let summary = "Produce a vector of indices along a specified dimension";
+  let description = [{
+    Creates a register-resident tensor containing the index values for each
+    thread along the specified symbolic dimension. The index computation uses
+    the index mapping associated with the operation: for each element position
+    i, the value is `start + i * stride`, where start and stride come from
+    the index mapping for the specified dimension.
+
+    The result type must be a 1-dimensional tensor (or vector) with an integer
+    element type, indexed by the specified dimension.
+
+    Example:
+    ```mlir
+    %idx = wave.self_index @N index {...} : !wave.tensor<[N], i32, register>
+    ```
+  }];
+
+  let arguments = !con((ins
+    Arg<WaveSymbolAttr, "Dimension to index over">:$dim,
+    Arg<OptionalAttr<I64Attr>,
+        "Number of elements processed by each thread">:$elements_per_thread
+  ), commonArguments);
+
+  let results = (outs
+    Res<WaveTensorInRegister, "Index values">:$result
+  );
+
+  let assemblyFormat =
+    "custom<SingleSymbol>($dim) " # commonArgumentsSyntax # " attr-dict `:`"
+    " type($result)";
+  let hasVerifier = 1;
+}
+
+def PermuteOp : WaveOp<"permute", [
+    DeclareOpInterfaceMethods<WaveInferTypeOpInterface>,
+    WaveElementsPerThreadOpInterface, IdentityElementsPerThreadOpTrait,
+    DeclareOpInterfaceMethods<WaveInferIndexExprsOpInterface>]> {
+  let summary = "Permute the dimensions of a register-resident tensor";
+  let description = [{
+    Reorders the symbolic dimensions of a register-resident tensor according
+    to the result type shape. This operation is primarily a semantic marker
+    that affects how index expressions are transformed during compilation.
+    At lowering time, the operation is a pass-through since the actual data
+    layout in registers remains unchanged - only the interpretation of which
+    dimension each element belongs to changes.
+
+    For example, permuting a tensor with shape [B, M, N] to [M, N, B] swaps
+    the strides associated with the symbolic dimensions in the index
+    expressions.
+
+    The result type, when fully-specified, must be a permutation of the input
+    shape (same symbols in a different order). If the result type is not
+    fully-specified, its shape will be inferred from the input type during
+    type inference.
+  }];
+  let arguments = !con((ins
+    Arg<WaveTensorInRegister, "Value to permute">:$value
+  ), commonArguments);
+  let results = (outs
+    Res<WaveTensorInRegister, "Permuted value">:$result
+  );
+
+  let assemblyFormat =
+    "$value " # commonArgumentsSyntax # " attr-dict `:`"
+    "qualified(type($value)) `to` qualified(type($result))";
 
   let hasVerifier = 1;
 }

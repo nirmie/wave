@@ -26,6 +26,23 @@ from wave_lang.kernel.wave.utils.general_utils import (
 from wave_lang.kernel.wave.constraints import (
     ScaledMMAType,
 )
+from wave_lang.kernel.wave.templates import (
+    get_tagged_mxfp4_gemm,
+    get_tagged_mxfp4_gemm_preshuffle_b,
+)
+from wave_lang.kernel.wave.schedules import (
+    get_mxfp4_dbuf_schedule,
+    get_mxfp4_asymmetric_schedule,
+)
+from wave_lang.kernel.wave.utils.mxfp_utils import (
+    SCALE_GROUP_SIZE,
+    generate_gemm_afp4wfp4_inputs,
+    mxfp4_to_f32,
+    e8m0_to_f32,
+    torchScaledGemmMXFP4,
+    b_preshuffle,
+    e8m0_shuffle,
+)
 
 from .common.utils import (
     extract_kernel_metadata,
@@ -36,35 +53,6 @@ from .common.utils import (
     require_gfx1250,
     use_water_backend_bool,
 )
-
-# Note this is specified by the HW and cannot be changed.
-SCALE_GROUP_SIZE = 32
-
-
-def generate_gemm_afp4wfp4_inputs(
-    shape: tuple[int, int, int], device: torch.device = get_default_device()
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    M, N, K = shape
-    torch.manual_seed(5)
-    # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device=device)
-    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device=device)
-    x = x_low | x_high << 4
-    w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device=device)
-    w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device=device)
-    w = w_low | w_high << 4
-    w = w.T
-    # Scale of 1.0 in e8m0, bias 127.
-    x_scales = torch.randint(
-        124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device=device
-    )
-    w_scales = torch.randint(
-        124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device=device
-    )
-    x_scales = x_scales.T.contiguous()
-    w_scales = w_scales.T.contiguous()
-
-    return x, w, x_scales, w_scales
 
 
 def generate_gemm_afp8wfp8_inputs(shape):
@@ -81,56 +69,6 @@ def generate_gemm_afp8wfp8_inputs(shape):
     w_scales = w_scales.T
 
     return x, w, x_scales, w_scales
-
-
-def mxfp4_to_f32(x: torch.Tensor) -> torch.Tensor:
-    # 2 because we pack fp4 in uint8.
-    x = x.repeat_interleave(2, dim=1)
-    x[:, ::2] = x[:, ::2] & 0xF
-    x[:, 1::2] = x[:, 1::2] >> 4
-    mxfp4_list = [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ]
-    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device=x.device)
-    return mxfp4_in_f32[x.long()]
-
-
-def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
-    x_f32 = 2 ** ((x - 127).to(torch.float32))
-    x_f32[x_f32 == 128] = float("nan")
-    return x_f32
-
-
-def torchScaledGemmMXFP4(
-    x: torch.Tensor, w: torch.Tensor, x_scales: torch.Tensor, w_scales: torch.Tensor
-) -> torch.Tensor:
-    # First convert the x and w inputs to f32.
-    x_f32 = mxfp4_to_f32(x)
-    w_f32 = mxfp4_to_f32(w.T)
-    w_f32 = w_f32.T
-    # Next convert the e8m0 scales to f32.
-    x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
-    x_scales_f32 = e8m0_to_f32(x_scales)
-    x_f32 = x_f32 * x_scales_f32
-    w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
-    w_scales_f32 = e8m0_to_f32(w_scales)
-    w_f32 = w_f32 * w_scales_f32.T
-    return torch.mm(x_f32, w_f32)
 
 
 def torchScaledGemmMXFP8(x, w, x_scales, w_scales):
@@ -157,6 +95,7 @@ def torchScaledGemmMXFP8(x, w, x_scales, w_scales):
     ],
 )
 @param_bool("use_global_to_shared")
+@param_bool("dynamic_dims", "dyn")
 @pytest.mark.parametrize(
     "enable_scheduling",
     [
@@ -171,6 +110,7 @@ def testScaledGemmMXFP4(
     mfma_variant: ScaledMMAType,
     enable_scheduling: SchedulingType,
     use_global_to_shared: bool,
+    dynamic_dims: bool,
 ):
     # Input sizes
     M = tkl.sym.M
@@ -228,11 +168,19 @@ def testScaledGemmMXFP4(
     }
     hyperparams.update(get_default_scheduling_params())
 
+    dynamic_symbols = []
+    if dynamic_dims:
+        dynamic_symbols = [M, N, K]
+        del hyperparams[M]
+        del hyperparams[N]
+        del hyperparams[K]
+
     options = WaveCompileOptions(
         subs=hyperparams,
         canonicalize=True,
         schedule=enable_scheduling,
         use_global_to_shared=use_global_to_shared,
+        dynamic_symbols=dynamic_symbols,
     )
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm)
@@ -407,7 +355,7 @@ def testScaledBatchedGemmMXFP4Codegen(use_water_backend: bool, tmp_path: Path):
     # We encode the exact registers and wait counts as we want to know if
     # they suddenly change due to backend or upstream MLIR changes.
     if use_water_backend:
-        vgpr_count = 160
+        vgpr_count = 164
         vgpr_spill_count = 0
         sgpr_count = 57
         sgpr_spill_count = 0
@@ -417,16 +365,14 @@ def testScaledBatchedGemmMXFP4Codegen(use_water_backend: bool, tmp_path: Path):
             "s_waitcnt vmcnt(0) lgkmcnt(0)",
             "s_waitcnt vmcnt(0)",
             "s_waitcnt lgkmcnt(7)",
-            "s_waitcnt lgkmcnt(6)",
             "s_waitcnt lgkmcnt(5)",
             "s_waitcnt lgkmcnt(4)",
             "s_waitcnt lgkmcnt(3)",
-            "s_waitcnt lgkmcnt(2)",
             "s_waitcnt lgkmcnt(1)",
             "s_waitcnt lgkmcnt(0)",
         ]
     else:
-        vgpr_count = 160
+        vgpr_count = 164
         vgpr_spill_count = 0
         sgpr_count = 59
         sgpr_spill_count = 0
@@ -435,10 +381,10 @@ def testScaledBatchedGemmMXFP4Codegen(use_water_backend: bool, tmp_path: Path):
             "s_waitcnt vmcnt(0)",
             "s_waitcnt vmcnt(0) lgkmcnt(0)",
             "s_waitcnt vmcnt(0)",
+            "s_waitcnt lgkmcnt(1)",
             "s_waitcnt lgkmcnt(5)",
             "s_waitcnt lgkmcnt(4)",
             "s_waitcnt lgkmcnt(3)",
-            "s_waitcnt lgkmcnt(2)",
             "s_waitcnt lgkmcnt(1)",
             "s_waitcnt lgkmcnt(0)",
         ]
@@ -677,6 +623,217 @@ def testBroadcastedScaleGemmMXFP4(
         compacted_x_scales.view(-1, 1).repeat(1, x_scales.shape[-1]).contiguous()
     )
     torch_out = torchScaledGemmMXFP4(x, w, broadcasted_compacted_x_scales, w_scales)
+
+    torch.testing.assert_close(torch_out, out, check_dtype=False)
+
+
+@require_e2e
+@require_cdna4
+@pytest.mark.parametrize(
+    "shape",
+    [(1024, 1024, 8192)],
+)
+@pytest.mark.parametrize(
+    "block_shape",
+    [(256, 256, 256)],
+)
+@pytest.mark.parametrize(
+    "mfma_variant",
+    [ScaledMMAType.F32_16x16x128_F8F6F4],
+)
+@pytest.mark.parametrize(
+    "wave_shape,use_stagger",
+    [
+        ((2, 2), False),
+        ((4, 2), True),
+    ],
+)
+def testScaledGemmMXFP4ManualDoubleBuf(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    mfma_variant: ScaledMMAType,
+    wave_shape: tuple[int, int],
+    use_stagger: bool,
+):
+    """End-to-end test for CDNA4 MXFP4 scaled GEMM with manual double-buffer schedule."""
+    gemm, options = get_tagged_mxfp4_gemm(
+        shape, block_shape, wave_shape=wave_shape, mfma_variant=mfma_variant
+    )
+    schedule = get_mxfp4_dbuf_schedule(use_stagger=use_stagger)
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    out = device_zeros(x.shape[0], w.shape[1], dtype=torch.float32)
+
+    w_t = w.T.contiguous()
+    gemm(x, x_scales, w_t, w_scales, out)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    torch.testing.assert_close(torch_out, out, check_dtype=False)
+
+
+@require_e2e
+@require_cdna4
+@pytest.mark.parametrize(
+    "shape",
+    [(1024, 1024, 8192)],
+)
+@pytest.mark.parametrize(
+    "block_shape",
+    [(256, 256, 256)],
+)
+@pytest.mark.parametrize(
+    "mfma_variant",
+    [ScaledMMAType.F32_16x16x128_F8F6F4],
+)
+@use_water_backend_bool("use_water_backend")
+def testScaledGemmMXFP4AsymmetricSchedule(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    mfma_variant: ScaledMMAType,
+    use_water_backend: bool,
+):
+    """End-to-end test for asymmetric MXFP4 GEMM: A through LDS, B direct from global."""
+    gemm, options = get_tagged_mxfp4_gemm(
+        shape,
+        block_shape,
+        wave_shape=(1, 4),
+        mfma_variant=mfma_variant,
+        b_address_space=GLOBAL_ADDRESS_SPACE,
+    )
+    schedule = get_mxfp4_asymmetric_schedule()
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+    options.use_buffer_ops = True
+    options.use_water_backend = use_water_backend
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    out = device_zeros(x.shape[0], w.shape[1], dtype=torch.float32)
+
+    w_t = w.T.contiguous()
+    gemm(x, x_scales, w_t, w_scales, out)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    torch.testing.assert_close(torch_out, out, check_dtype=False)
+
+
+@require_e2e
+@require_cdna4
+@pytest.mark.parametrize(
+    "shape",
+    [(1024, 1024, 8192)],
+)
+@pytest.mark.parametrize(
+    "block_shape",
+    [(256, 256, 256), (64, 192, 256)],
+)
+@pytest.mark.parametrize(
+    "mfma_variant",
+    [ScaledMMAType.F32_16x16x128_F8F6F4],
+)
+@use_water_backend_bool("use_water_backend")
+def testScaledGemmMXFP4PreshuffleB(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    mfma_variant: ScaledMMAType,
+    use_water_backend: bool,
+):
+    """End-to-end test for MXFP4 GEMM with preshuffled B data and B scales."""
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape,
+        block_shape,
+        wave_shape=(1, 4),
+        mfma_variant=mfma_variant,
+    )
+    schedule = get_mxfp4_asymmetric_schedule()
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+    options.use_buffer_ops = True
+    options.use_water_backend = use_water_backend
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    w_t = w.T.contiguous()
+    w_t_ps = b_preshuffle(w_t)
+    x_scales_ps = e8m0_shuffle(x_scales)
+    w_scales_ps = e8m0_shuffle(w_scales)
+
+    out = device_zeros(x.shape[0], w_t_ps.shape[0], dtype=torch.float32)
+    gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
+
+    torch.testing.assert_close(torch_out, out, check_dtype=False)
+
+
+MACROTILES_PRESHUFFLE = [
+    (256, 256, 128),
+    (256, 192, 128),
+    (256, 128, 128),
+    (128, 256, 128),
+    (128, 192, 128),
+    (128, 128, 256),
+    (128, 128, 128),
+    (64, 256, 128),
+    (64, 192, 256),
+    (64, 192, 128),
+    (64, 128, 256),
+    (64, 128, 128),
+    (64, 64, 128),
+    (32, 192, 256),
+    (32, 128, 256),
+    (32, 64, 256),
+]
+
+
+@require_e2e
+@require_cdna4
+@pytest.mark.parametrize(
+    "shape",
+    [(1024, 1024, 8192)],
+)
+@pytest.mark.parametrize("block_shape", MACROTILES_PRESHUFFLE)
+@pytest.mark.parametrize(
+    "mfma_variant",
+    [ScaledMMAType.F32_16x16x128_F8F6F4],
+)
+@pytest.mark.parametrize("a_scale_preshuffle", [False])
+def testScaledGemmMXFP4PreshuffleMacrotiles(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    mfma_variant: ScaledMMAType,
+    a_scale_preshuffle: bool,
+):
+    """Preshuffle MXFP4 GEMM over macrotiles with a_scale_preshuffle on/off."""
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape,
+        block_shape,
+        wave_shape=(1, 4),
+        mfma_variant=mfma_variant,
+        a_scale_preshuffle=a_scale_preshuffle,
+    )
+    schedule = get_mxfp4_asymmetric_schedule()
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+    options.use_buffer_ops = True
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    w_t = w.T.contiguous()
+    w_t_ps = b_preshuffle(w_t)
+    x_scales_ps = e8m0_shuffle(x_scales)
+    w_scales_ps = e8m0_shuffle(w_scales)
+
+    a_scale_arg = x_scales_ps if a_scale_preshuffle else x_scales
+    out = device_zeros(x.shape[0], w_t_ps.shape[0], dtype=torch.float32)
+    gemm(x, a_scale_arg, w_t_ps, w_scales_ps, out)
 
     torch.testing.assert_close(torch_out, out, check_dtype=False)
 

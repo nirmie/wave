@@ -43,7 +43,7 @@ if is_water_available():
     from water_mlir.water_mlir import ir
     from water_mlir.water_mlir.dialects import wave
 
-    from mlir_converter.mlir_to_wave import (
+    from mlir_converter.attr_type_converter import (
         _convert_affine_expr_to_sympy_expr,
         _convert_index_mapping_attr_to_sympy,
         _convert_index_mapping_dict_to_sympy,
@@ -208,11 +208,9 @@ class TestConvertAffineExprToSympyExpr:
         result = _convert_affine_expr_to_sympy_expr(expr, symbol_mapping)
         assert result == sympy.floor((2 * x + y) / z)
 
-    def test_unsupported_expr_raises_error(self):
-        """Test that unsupported expression types raise ValueError."""
-        # Create a dimension expression (not supported by the function)
+    def test_dim_expr_raises(self):
+        """AffineDimExpr is not expected in Wave maps (all use numDims=0)."""
         expr = ir.AffineDimExpr.get(0)
-
         with pytest.raises(ValueError, match="Unsupported affine expression"):
             _convert_affine_expr_to_sympy_expr(expr, [])
 
@@ -292,7 +290,7 @@ class TestConvertIndexMappingAttrToSympy:
         assert result.stride == 1
 
     def test_index_mapping_with_null_start(self):
-        attr = ir.Attribute.parse("#wave<index_mapping[] -> (<NULL>, 1, 1)>")
+        attr = ir.Attribute.parse("#wave.index_mapping<[] -> (<NULL>, 1, 1)>")
         result = _convert_index_mapping_attr_to_sympy(attr)
         assert isinstance(result, IndexSequence)
         assert result.start is None
@@ -300,7 +298,7 @@ class TestConvertIndexMappingAttrToSympy:
         assert result.stride == 1
 
     def test_index_mapping_with_null_step_stride(self):
-        attr = ir.Attribute.parse("#wave<index_mapping[] -> (1, <NULL>, <NULL>)>")
+        attr = ir.Attribute.parse("#wave.index_mapping<[] -> (1, <NULL>, <NULL>)>")
         result = _convert_index_mapping_attr_to_sympy(attr)
         assert isinstance(result, IndexSequence)
         assert result.start == 1

@@ -288,6 +288,42 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
 // -----
 
 normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_max
+  func.func @lower_max() attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    // CHECK-NOT: wave.max
+    // CHECK:     %[[LHS:.*]] = arith.constant dense<0.000000e+00> : vector<4xf32>
+    // CHECK:     %[[RHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    // CHECK:     arith.maximumf %[[LHS]], %[[RHS]] : vector<4xf32>
+    %cst = arith.constant 0.0 : f32
+    %lhs = wave.register %cst : vector<4xf32>
+    %cst1 = arith.constant 1.0 : f32
+    %rhs = wave.register %cst1 : vector<4xf32>
+    %maxf = wave.max %lhs, %rhs : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+    return
+  }
+}
+
+// -----
+
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_min
+  func.func @lower_min() attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    // CHECK-NOT: wave.min
+    // CHECK:     %[[LHS:.*]] = arith.constant dense<0.000000e+00> : vector<4xf32>
+    // CHECK:     %[[RHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    // CHECK:     arith.minimumf %[[LHS]], %[[RHS]] : vector<4xf32>
+    %cst = arith.constant 0.0 : f32
+    %lhs = wave.register %cst : vector<4xf32>
+    %cst1 = arith.constant 1.0 : f32
+    %rhs = wave.register %cst1 : vector<4xf32>
+    %minf = wave.min %lhs, %rhs : (vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+    return
+  }
+}
+
+// -----
+
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
   // CHECK-LABEL: func.func @lower_sub
   func.func @lower_sub() attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
     // CHECK-NOT: wave.sub
@@ -372,6 +408,122 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
 // -----
 
 normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_apply_expr
+  func.func @lower_apply_expr() -> vector<4xi32> attributes {wave.hyperparameters = #wave.hyperparameters<{N = 10}>} {
+    %cst = arith.constant 42 : i32
+    %input = wave.register %cst : vector<4xi32>
+    %cst3 = arith.constant 3 : i32
+    %input2 = wave.register %cst3 : vector<4xi32>
+    // CHECK: %[[CST_42:.+]] = arith.constant dense<42> : vector<4xi32>
+    // CHECK: %[[CST_3:.+]] = arith.constant dense<3> : vector<4xi32>
+    // CHECK: %[[CST_10:.+]] = arith.constant dense<10> : vector<4xi32>
+    // CHECK: %[[CST_2:.+]] = arith.constant dense<2> : vector<4xi32>
+    // CHECK: %[[MUL:.+]] = arith.muli %[[CST_10]], %[[CST_2]] overflow<nsw, nuw> : vector<4xi32>
+    // CHECK: %[[ADD:.+]] = arith.addi %[[CST_42]], %[[MUL]] overflow<nsw, nuw> : vector<4xi32>
+    // CHECK: %[[CST_N1:.+]] = arith.constant dense<-1> : vector<4xi32>
+    // CHECK: %[[MUL2:.+]] = arith.muli %[[CST_3]], %[[CST_N1]] overflow<nsw, nuw> : vector<4xi32>
+    // CHECK: %[[ADD2:.+]] = arith.addi %[[ADD]], %[[MUL2]] overflow<nsw, nuw> : vector<4xi32>
+    // CHECK: %[[CST_1:.+]] = arith.constant dense<1> : vector<4xi32>
+    // CHECK: %[[ADD3:.+]] = arith.addi %[[ADD2]], %[[CST_1]] overflow<nsw, nuw> : vector<4xi32>
+    %result = wave.apply_expr(%input, %input2)
+      <[#wave.operand<1>, #wave.symbol<"N">, #wave.operand<0>] ->
+      (_Operand_0 + 1 + 2 * N - _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi32>
+    return %result : vector<4xi32>
+  }
+}
+
+// -----
+
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_apply_comparisons
+  func.func @lower_apply_comparisons() -> vector<4xi1> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %cst = arith.constant 42 : i32
+    %input = wave.register %cst : vector<4xi32>
+    %cst2 = arith.constant 2 : i32
+    %input2 = wave.register %cst2 : vector<4xi32>
+    // CHECK: %[[CST_42:.+]] = arith.constant dense<42> : vector<4xi32>
+    // CHECK: %[[CST_2:.+]] = arith.constant dense<2> : vector<4xi32>
+    // CHECK: %[[LT:.+]] = arith.cmpi slt, %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    // CHECK: %[[GT:.+]] = arith.cmpi sgt, %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    // CHECK: %[[LE:.+]] = arith.cmpi sle, %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    // CHECK: %[[EXT_LE:.+]] = arith.extui %[[LE]] : vector<4xi1> to vector<4xi32>
+    // CHECK: %[[GE:.+]] = arith.cmpi sge, %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    // CHECK: %[[EQ:.+]] = arith.cmpi eq, %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    // CHECK: %[[EXT_EQ:.+]] = arith.extui %[[EQ]] : vector<4xi1> to vector<4xi64>
+    // CHECK: %[[NE:.+]] = arith.cmpi ne, %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    %result1 = wave.apply_expr(%input, %input2) lt <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi1>
+    %result2 = wave.apply_expr(%input, %input2) gt <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi1>
+    %result3 = wave.apply_expr(%input, %input2) le <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi32>
+    %result4 = wave.apply_expr(%input, %input2) ge <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi1>
+    %result5 = wave.apply_expr(%input, %input2) eq <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi64>
+    %result6 = wave.apply_expr(%input, %input2) ne <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi1>
+    return %result1 : vector<4xi1>
+  }
+}
+
+// -----
+
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_apply_expr_minmax
+  func.func @lower_apply_expr_minmax() -> vector<4xi32> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %cst = arith.constant 42 : i32
+    %input = wave.register %cst : vector<4xi32>
+    %cst2 = arith.constant 2 : i32
+    %input2 = wave.register %cst2 : vector<4xi32>
+    // CHECK: %[[CST_42:.+]] = arith.constant dense<42> : vector<4xi32>
+    // CHECK: %[[CST_2:.+]] = arith.constant dense<2> : vector<4xi32>
+    // CHECK: %[[MIN:.+]] = arith.minsi %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    // CHECK: %[[MAX:.+]] = arith.maxsi %[[CST_42]], %[[CST_2]] : vector<4xi32>
+    %result1 = wave.apply_expr(%input, %input2) min <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi32>
+    %result2 = wave.apply_expr(%input, %input2) max <[#wave.operand<0>, #wave.operand<1>] -> (_Operand_0, _Operand_1)> : (vector<4xi32>, vector<4xi32>) -> vector<4xi32>
+    return %result1 : vector<4xi32>
+  }
+}
+
+// -----
+
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_apply_expr_div
+  func.func @lower_apply_expr_div() -> vector<4xi64> attributes {wave.hyperparameters = #wave.hyperparameters<{A = 15, B = 4}>} {
+    // CHECK: %[[CST_A:.+]] = arith.constant dense<15> : vector<4xi64>
+    // CHECK: %[[CST_B:.+]] = arith.constant dense<4> : vector<4xi64>
+    // CHECK: %[[FLOORDIV:.+]] = arith.floordivsi %[[CST_A]], %[[CST_B]] : vector<4xi64>
+    // CHECK: %[[CEILDIV:.+]] = arith.ceildivsi %{{.*}}, %{{.*}} : vector<4xi64>
+    // CHECK: %[[ADD:.+]] = arith.addi %[[FLOORDIV]], %[[CEILDIV]] overflow<nsw, nuw> : vector<4xi64>
+    // CHECK: %[[REM:.+]] = arith.remsi %{{.*}}, %{{.*}} : vector<4xi64>
+    // CHECK: %[[ADD2:.+]] = arith.addi %[[ADD]], %[[REM]] overflow<nsw, nuw> : vector<4xi64>
+    // CHECK: return %[[ADD2]] : vector<4xi64>
+    %result = wave.apply_expr()
+      <[#wave.symbol<"A">, #wave.symbol<"B">] ->
+      ((A floordiv B) + (A ceildiv B) + (A mod B))>
+      : () -> vector<4xi64>
+    return %result : vector<4xi64>
+  }
+}
+
+// -----
+
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_select
+  func.func @lower_select() attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    // CHECK-NOT: wave.select
+    // CHECK:     %[[COND:.*]] = arith.constant dense<true> : vector<4xi1>
+    // CHECK:     %[[LHS:.*]] = arith.constant dense<0.000000e+00> : vector<4xf32>
+    // CHECK:     %[[RHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    // CHECK:     arith.select %[[COND]], %[[LHS]], %[[RHS]] : vector<4xi1>, vector<4xf32>
+    %cond_a = arith.constant 1 : i1
+    %cond = wave.register %cond_a : vector<4xi1>
+    %cst = arith.constant 0.0 : f32
+    %lhs = wave.register %cst : vector<4xf32>
+    %cst1 = arith.constant 1.0 : f32
+    %rhs = wave.register %cst1 : vector<4xf32>
+    %select = wave.select %cond, %lhs, %rhs : (vector<4xi1>, vector<4xf32>, vector<4xf32>) -> vector<4xf32>
+    return
+  }
+}
+// -----
+
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
 // CHECK-LABEL: func.func @lower_alloc_view
 func.func @lower_alloc_view() attributes {wave.hyperparameters = #wave.hyperparameters<{BLOCK_M = 4, BLOCK_K = 28}>}  {
   // CHECK: %[[BUFF:.*]] = memref.alloc() : memref<256xi8, #gpu.address_space<workgroup>>
@@ -411,11 +563,11 @@ func.func @lower_read(%mem: !wave.tensor<[@M, @N] of f16, <global>>) attributes 
       // CHECK: %[[TIDX_X:.*]] = gpu.thread_id x
       // Note: BLOCK_M = 64
       // CHECK: %[[ROW:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + (s1 floordiv 64) * 32 + s1 mod 64)>()[%[[BIDX_X]], %[[TIDX_X]]]
-      M : [#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 mod 64, 1, 64),
+      M : <[#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 mod 64, 1, 64)>,
       // CHECK: %[[BIDX_Y:.*]] = gpu.block_id y
       // CHECK: %[[TIDX_Y:.*]] = gpu.thread_id y
       // CHECK: %[[COL:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + s1 * 8)>()[%[[BIDX_Y]], %[[TIDX_Y]]]
-      N : [#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, BLOCK_N ceildiv 8, 1)}]
+      N : <[#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, BLOCK_N ceildiv 8, 1)>}]
      : (!wave.tensor<[@M, @N] of f16, <global>>) -> vector<8xf16>
      // CHECK: %[[VEC:.+]] = vector.load {{.*}}[%[[ROW]], %[[COL]]] : memref<{{.*}}xf16{{.*}}>, vector<8xf16>
 
@@ -433,11 +585,11 @@ func.func @lower_read_non_innermost_dim(%mem: !wave.tensor<[@M, @N] of f16, <glo
     // CHECK: %[[TIDX_X:.*]] = gpu.thread_id x
     // Note: BLOCK_M = 64
     // CHECK: %[[ROW:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + (s1 floordiv 64) * 32 + s1 * 8)>()[%[[BIDX_X]], %[[TIDX_X]]]
-    M : [#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 * 8 , 8, 64),
+    M : <[#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 * 8 , 8, 64)>,
     // CHECK: %[[BIDX_Y:.*]] = gpu.block_id y
     // CHECK: %[[TIDX_Y:.*]] = gpu.thread_id y
     // CHECK: %[[COL:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + s1 * 8)>()[%[[BIDX_Y]], %[[TIDX_Y]]]
-    N : [#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, 1, 1)}]
+    N : <[#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, 1, 1)>}]
     : (!wave.tensor<[@M, @N] of f16, <global>>) -> vector<8xf16>
     // CHECK: %[[PAD:.*]] = arith.constant {{.*}} : f16
     // CHECK: vector.transfer_read {{.*}}[%[[ROW]], %[[COL]]], %[[PAD]] {permutation_map = affine_map<(d0, d1) -> (d0)>} : memref<{{.*}}xf16{{.*}}>, vector<8xf16>
@@ -456,14 +608,14 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
         // CHECK: %[[BIDX_X:.*]] = gpu.block_id x
         // CHECK: %[[TIDX_X:.*]] = gpu.thread_id x
         // CHECK: %[[ROW:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + s1)>()[%[[BIDX_X]], %[[TIDX_X]]]
-        M : [#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (WG0 * BLOCK_M + T0, 1, 64),
+        M : <[#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (WG0 * BLOCK_M + T0, 1, 64)>,
         // CHECK: %[[BIDX_Y:.*]] = gpu.block_id y
         // CHECK: %[[TIDX_Y:.*]] = gpu.thread_id y
         // CHECK: %[[COL:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + s1 * 32)>()[%[[BIDX_Y]], %[[TIDX_Y]]]
-        N : [#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + T1 * 32, 4, 1)
-      }] { bounds = #wave.read_write_bounds<{
-        M = #wave.expr_list<[#wave.symbol<"M">] -> (M)>,
-        N = #wave.expr_list<[#wave.symbol<"N">] -> (N)>}>}
+        N : <[#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + T1 * 32, 4, 1)>
+      }] { bounds = #wave.symbol_mapping<
+        @M = #wave.expr_list<[#wave.symbol<"M">] -> (M)>,
+        @N = #wave.expr_list<[#wave.symbol<"N">] -> (N)>>}
       : (!wave.tensor<[@M, @N] of f16, <global>>) -> vector<4xf16>
       // Bounds for dim 0.
       // CHECK: %[[DIM0_SIZE:.+]] = affine.apply affine_map<() -> (100)>()
@@ -494,15 +646,43 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
   func.func @lower_read_masked_non_innermost_dim(%mem: !wave.tensor<[@M, @N] of f16, <global>>)
       attributes {wave.hyperparameters = #wave.hyperparameters<{BLOCK_M = 64, BLOCK_N = 64, M = 100, N = 50}>} {
     %v = wave.read %mem index [{
-        M : [#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (WG0 * BLOCK_M + T0, 8, 64),
-        N : [#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + T1 * 32, 1, 1)
-      }] { bounds = #wave.read_write_bounds<{
-        M = #wave.expr_list<[#wave.symbol<"M">] -> (M)>,
-        N = #wave.expr_list<[#wave.symbol<"N">] -> (N)>}>}
+        M : <[#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (WG0 * BLOCK_M + T0, 8, 64)>,
+        N : <[#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + T1 * 32, 1, 1)>
+      }] { bounds = #wave.symbol_mapping<
+        @M = #wave.expr_list<[#wave.symbol<"M">] -> (M)>,
+        @N = #wave.expr_list<[#wave.symbol<"N">] -> (N)>>}
       : (!wave.tensor<[@M, @N] of f16, <global>>) -> vector<8xf16>
       // CHECK: %[[MASK:.+]] = arith.andi {{.*}}, {{.*}}
       // CHECK: %[[PAD:.*]] = arith.constant {{.*}} : f16
       // CHECK: vector.transfer_read {{.*}}[{{.*}}, {{.*}}], %[[PAD]], %[[MASK]] {in_bounds = [true], permutation_map = affine_map<(d0, d1) -> (d0)>} : memref<{{.*}}xf16{{.*}}>, vector<8xf16>
+    return
+  }
+}
+
+// -----
+
+// Sparse bounds: only M needs masking, N is fully tiled (no entry).
+// The mask should only check the M dimension — no arith.andi.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: @lower_read_sparse_bounds
+  func.func @lower_read_sparse_bounds(%mem: !wave.tensor<[@M, @N] of f16, <global>>)
+      attributes {wave.hyperparameters = #wave.hyperparameters<{BLOCK_M = 64, BLOCK_N = 64, M = 100, N = 64}>} {
+    %v = wave.read %mem index [{
+        // CHECK: %[[BIDX_X:.*]] = gpu.block_id x
+        // CHECK: %[[TIDX_X:.*]] = gpu.thread_id x
+        // CHECK: %[[ROW:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + s1)>()[%[[BIDX_X]], %[[TIDX_X]]]
+        M : <[#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (WG0 * BLOCK_M + T0, 1, 64)>,
+        N : <[#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + T1 * 32, 4, 1)>
+      }] { bounds = #wave.symbol_mapping<
+        @M = #wave.expr_list<[#wave.symbol<"M">] -> (M)>>}
+      : (!wave.tensor<[@M, @N] of f16, <global>>) -> vector<4xf16>
+      // Only M dimension produces a mask — no andi needed.
+      // CHECK: %[[DIM0_SIZE:.+]] = affine.apply affine_map<() -> (100)>()
+      // CHECK: %[[DIM0_CMP:.+]] = arith.cmpi slt, %[[ROW]], %[[DIM0_SIZE]]
+      // CHECK: %[[MASK:.+]] = vector.broadcast %[[DIM0_CMP]] : i1 to vector<4xi1>
+      // CHECK-NOT: arith.andi
+      // CHECK: %[[CST0:.+]] = arith.constant dense<0.000000e+00> : vector<4xf16>
+      // CHECK: vector.maskedload %{{.*}}[%[[ROW]], %{{.*}}], %[[MASK]], %[[CST0]]
     return
   }
 }
@@ -516,8 +696,8 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
     // Test ReadOp lowering when result is already a vector type
     // (simulates after PropagateElementsPerThread pass)
     %0 = wave.read %mem index [{
-        M : [#wave.index_symbol<WG0>] -> (WG0, 1, 1),
-        N : [#wave.index_symbol<T0>] -> (T0, 8, 1)
+        M : <[#wave.index_symbol<WG0>] -> (WG0, 1, 1)>,
+        N : <[#wave.index_symbol<T0>] -> (T0, 8, 1)>
       }]
       : (!wave.tensor<[@M, @N] of f16, <global>>) -> vector<8xf16>
 
@@ -539,11 +719,11 @@ func.func @lower_write(%mem: !wave.tensor<[@M, @N] of f16, <global>>) attributes
       // CHECK: %[[TIDX_X:.*]] = gpu.thread_id x
       // Note: BLOCK_M = 64
       // CHECK: %[[ROW:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + (s1 floordiv 64) * 32 + s1 mod 64)>()[%[[BIDX_X]], %[[TIDX_X]]]
-      M : [#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 mod 64, 1, 64),
+      M : <[#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 mod 64, 1, 64)>,
       // CHECK: %[[BIDX_Y:.*]] = gpu.block_id y
       // CHECK: %[[TIDX_Y:.*]] = gpu.thread_id y
       // CHECK: %[[COL:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + s1 * 8)>()[%[[BIDX_Y]], %[[TIDX_Y]]]
-      N : [#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, BLOCK_N ceildiv 8, 1)}]
+      N : <[#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, BLOCK_N ceildiv 8, 1)>}]
      : vector<8xf16>, !wave.tensor<[@M, @N] of f16, <global>>
      // CHECK: vector.store {{.*}}[%[[ROW]], %[[COL]]] : memref<{{.*}}xf16{{.*}}>, vector<8xf16>
      // CHECK-NOT: vector.transfer_write
@@ -563,11 +743,11 @@ func.func @lower_write_non_innermost(%mem: !wave.tensor<[@M, @N] of f16, <global
       // CHECK: %[[TIDX_X:.*]] = gpu.thread_id x
       // Note: BLOCK_M = 64
       // CHECK: %[[ROW:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + (s1 floordiv 64) * 32 + s1 mod 64)>()[%[[BIDX_X]], %[[TIDX_X]]]
-      M : [#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 mod 64, 8, 64),
+      M : <[#wave.index_symbol<WG0>, #wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (BLOCK_M * WG0 + (BLOCK_M floordiv 2) * (T0 floordiv 64) + T0 mod 64, 8, 64)>,
       // CHECK: %[[BIDX_Y:.*]] = gpu.block_id y
       // CHECK: %[[TIDX_Y:.*]] = gpu.thread_id y
       // CHECK: %[[COL:.*]] = affine.apply affine_map<()[s0, s1] -> (s0 * 64 + s1 * 8)>()[%[[BIDX_Y]], %[[TIDX_Y]]]
-      N : [#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, 1, 1)}]
+      N : <[#wave.index_symbol<WG1>, #wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (WG1 * BLOCK_N + (BLOCK_N floordiv 8) * T1, 1, 1)>}]
      : vector<8xf16>, !wave.tensor<[@M, @N] of f16, <global>>
      // CHECK: vector.transfer_write {{.*}}, {{.*}}[{{.*}}, {{.*}}] {permutation_map = affine_map<(d0, d1) -> (d0)>} : vector<8xf16>, memref<{{.*}}xf16{{.*}}>
 
@@ -953,6 +1133,37 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
 
 // -----
 
+// Test permute lowering with read/write - permute should be a pass-through.
+// This simulates reading from memory, permuting dimensions, and writing back.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: @lower_permute_with_read_write
+  func.func @lower_permute_with_read_write(
+      %src: memref<64x64xf16, #gpu.address_space<workgroup>>,
+      %dst: memref<64x64xf16, #gpu.address_space<workgroup>>)
+      attributes {wave.hyperparameters = #wave.hyperparameters<{BLOCK_M = 64, BLOCK_N = 64}>} {
+    // CHECK: %[[READ:.*]] = vector.load %{{.*}}[%{{.*}}, %{{.*}}] : memref<64x64xf16, #gpu.address_space<workgroup>>, vector<8xf16>
+    %0 = wave.read %src index [{
+        BLOCK_M : <[#wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (T0 mod 64, 1, 64)>,
+        BLOCK_N : <[#wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (T1 * 8, 8, 1)>
+      }] {ordered_syms = [#wave.symbol<"BLOCK_M">, #wave.symbol<"BLOCK_N">]}
+      : (memref<64x64xf16, #gpu.address_space<workgroup>>) -> vector<8xf16>
+
+    // Permute is a pass-through at lowering time - just swaps dimension interpretation
+    // CHECK-NOT: wave.permute
+    %1 = wave.permute %0 : vector<8xf16> to vector<8xf16>
+
+    // CHECK: vector.store %[[READ]], %{{.*}}[%{{.*}}, %{{.*}}] : memref<64x64xf16, #gpu.address_space<workgroup>>, vector<8xf16>
+    wave.write %1, %dst index [{
+        BLOCK_N : <[#wave.index_symbol<T0>, #wave.symbol<"BLOCK_N">] -> (T0 mod 64, 1, 64)>,
+        BLOCK_M : <[#wave.index_symbol<T1>, #wave.symbol<"BLOCK_M">] -> (T1 * 8, 8, 1)>
+      }] {ordered_syms = [#wave.symbol<"BLOCK_N">, #wave.symbol<"BLOCK_M">]}
+      : vector<8xf16>, memref<64x64xf16, #gpu.address_space<workgroup>>
+    return
+  }
+}
+
+// -----
+
 // Test read/write lowering with MemRefType memory operand.
 // This simulates the state after ResolveDistributedAllocations pass has run.
 // Dimension ordering is provided via ordered_syms attribute.
@@ -962,15 +1173,15 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
       attributes {wave.hyperparameters = #wave.hyperparameters<{BLOCK_M = 64, BLOCK_N = 64}>} {
     // CHECK: %[[READ:.*]] = vector.load %{{.*}}[%{{.*}}, %{{.*}}] : memref<64x64xf16, #gpu.address_space<workgroup>>, vector<8xf16>
     %0 = wave.read %mem index [{
-        BLOCK_M : [#wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (T0 mod 64, 1, 64),
-        BLOCK_N : [#wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (T1 * 8, 8, 1)
+        BLOCK_M : <[#wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (T0 mod 64, 1, 64)>,
+        BLOCK_N : <[#wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (T1 * 8, 8, 1)>
       }] {ordered_syms = [#wave.symbol<"BLOCK_M">, #wave.symbol<"BLOCK_N">]}
       : (memref<64x64xf16, #gpu.address_space<workgroup>>) -> vector<8xf16>
 
     // CHECK: vector.store %[[READ]], %{{.*}}[%{{.*}}, %{{.*}}] : memref<64x64xf16, #gpu.address_space<workgroup>>, vector<8xf16>
     wave.write %0, %mem index [{
-        BLOCK_M : [#wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (T0 mod 64, 1, 64),
-        BLOCK_N : [#wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (T1 * 8, 8, 1)
+        BLOCK_M : <[#wave.index_symbol<T0>, #wave.symbol<"BLOCK_M">] -> (T0 mod 64, 1, 64)>,
+        BLOCK_N : <[#wave.index_symbol<T1>, #wave.symbol<"BLOCK_N">] -> (T1 * 8, 8, 1)>
       }] {ordered_syms = [#wave.symbol<"BLOCK_M">, #wave.symbol<"BLOCK_N">]}
       : vector<8xf16>, memref<64x64xf16, #gpu.address_space<workgroup>>
     return
@@ -999,9 +1210,9 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
     // CHECK: %[[IDX_N:.*]] = affine.apply affine_map<()[s0] -> (s0 * 4)>
     // CHECK: vector.load %{{.*}}[%[[IDX_M]], %[[IDX_K]], %[[IDX_N]]] : memref<64x32x128xf16, #gpu.address_space<workgroup>>, vector<8xf16>
     %0 = wave.read %mem index [{
-        M : [#wave.index_symbol<T0>] -> (T0, 1, 1),
-        K : [#wave.index_symbol<T1>] -> (T1 * 2, 1, 1),
-        N : [#wave.index_symbol<T2>] -> (T2 * 4, 8, 1)
+        M : <[#wave.index_symbol<T0>] -> (T0, 1, 1)>,
+        K : <[#wave.index_symbol<T1>] -> (T1 * 2, 1, 1)>,
+        N : <[#wave.index_symbol<T2>] -> (T2 * 4, 8, 1)>
       }] {ordered_syms = [#wave.symbol<"M">, #wave.symbol<"K">, #wave.symbol<"N">]}
       : (memref<64x32x128xf16, #gpu.address_space<workgroup>>) -> vector<8xf16>
       return
@@ -1073,5 +1284,365 @@ normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,re
     // CHECK: %[[RESULT:.*]], %{{.*}} = gpu.shuffle idx %[[REG]], %[[OFFSET]], %[[WIDTH]] : vector<1xi32>
     %1 = wave.shuffle idx %0, 8, 64 : (vector<1xi32>) -> vector<1xi32>
     return
+  }
+}
+
+// -----
+
+// Test wave.sum lowering - reduces input vector to scalar via thread-local
+// reduction followed by subgroup reduction.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_sum
+  // expected-warning @below {{unused hyperparameter: N}}
+  func.func @lower_sum() attributes {wave.hyperparameters = #wave.hyperparameters<{M = 64, N = 32}>} {
+    %cst_input = arith.constant 1.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    // CHECK: %[[INPUT:.*]] = arith.constant dense<1.000000e+00> : vector<8xf32>
+    %input = wave.register %cst_input : vector<8xf32>
+    // CHECK: %[[INIT:.*]] = arith.constant dense<0.000000e+00> : vector<1xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // CHECK-NOT: wave.sum
+    // CHECK: %[[INIT_ELEM:.*]] = vector.extract %[[INIT]][0] : f32 from vector<1xf32>
+    // CHECK: %[[THREAD_REDUCE:.*]] = vector.reduction <add>, %[[INPUT]], %[[INIT_ELEM]] : vector<8xf32> into f32
+    // CHECK: gpu.subgroup_reduce add %[[THREAD_REDUCE]] : (f32) -> f32
+    %result = wave.sum %input init(%init) along @M <warp> : (vector<8xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test wave.max_element lowering - reduces input vector to scalar via
+// thread-local max followed by subgroup max.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_max_element
+  // expected-warning @below {{unused hyperparameter: M}}
+  func.func @lower_max_element() attributes {wave.hyperparameters = #wave.hyperparameters<{M = 64, N = 32}>} {
+    %cst_input = arith.constant 2.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    // CHECK: %[[INPUT:.*]] = arith.constant dense<2.000000e+00> : vector<16xf32>
+    %input = wave.register %cst_input : vector<16xf32>
+    // CHECK: %[[INIT:.*]] = arith.constant dense<0.000000e+00> : vector<1xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // CHECK-NOT: wave.max_element
+    // CHECK: %[[INIT_ELEM:.*]] = vector.extract %[[INIT]][0] : f32 from vector<1xf32>
+    // CHECK: %[[THREAD_REDUCE:.*]] = vector.reduction <maximumf>, %[[INPUT]], %[[INIT_ELEM]] : vector<16xf32> into f32
+    // CHECK: gpu.subgroup_reduce maximumf %[[THREAD_REDUCE]] : (f32) -> f32
+    %result = wave.max_element %input init(%init) along @N <warp> : (vector<16xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test reduction with integer types.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_sum_integer
+  func.func @lower_sum_integer() attributes {wave.hyperparameters = #wave.hyperparameters<{K = 16}>} {
+    %cst_input = arith.constant 1 : i32
+    %cst_init = arith.constant 0 : i32
+    // CHECK: %[[INPUT:.*]] = arith.constant dense<1> : vector<4xi32>
+    %input = wave.register %cst_input : vector<4xi32>
+    // CHECK: %[[INIT:.*]] = arith.constant dense<0> : vector<1xi32>
+    %init = wave.register %cst_init : vector<1xi32>
+    // CHECK-NOT: wave.sum
+    // CHECK: %[[INIT_ELEM:.*]] = vector.extract %[[INIT]][0] : i32 from vector<1xi32>
+    // CHECK: %[[THREAD_REDUCE:.*]] = vector.reduction <add>, %[[INPUT]], %[[INIT_ELEM]] : vector<4xi32> into i32
+    // CHECK: gpu.subgroup_reduce add %[[THREAD_REDUCE]] : (i32) -> i32
+    %result = wave.sum %input init(%init) along @K <warp> : (vector<4xi32>, vector<1xi32>) -> vector<1xi32>
+    return
+  }
+}
+
+// -----
+
+// Test wave.sum lowering with <block> - uses gpu.all_reduce instead of gpu.subgroup_reduce.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_sum_block
+  // expected-warning @below {{unused hyperparameter: N}}
+  func.func @lower_sum_block() attributes {wave.hyperparameters = #wave.hyperparameters<{M = 64, N = 32}>} {
+    %cst_input = arith.constant 1.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    // CHECK: %[[INPUT:.*]] = arith.constant dense<1.000000e+00> : vector<8xf32>
+    %input = wave.register %cst_input : vector<8xf32>
+    // CHECK: %[[INIT:.*]] = arith.constant dense<0.000000e+00> : vector<1xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // CHECK-NOT: wave.sum
+    // CHECK: %[[INIT_ELEM:.*]] = vector.extract %[[INIT]][0] : f32 from vector<1xf32>
+    // CHECK: %[[THREAD_REDUCE:.*]] = vector.reduction <add>, %[[INPUT]], %[[INIT_ELEM]] : vector<8xf32> into f32
+    // CHECK: gpu.all_reduce add %[[THREAD_REDUCE]] {
+    // CHECK: } : (f32) -> f32
+    %result = wave.sum %input init(%init) along @M <block> : (vector<8xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test wave.max_element lowering with <block> - uses gpu.all_reduce instead of gpu.subgroup_reduce.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_max_element_block
+  // expected-warning @below {{unused hyperparameter: M}}
+  func.func @lower_max_element_block() attributes {wave.hyperparameters = #wave.hyperparameters<{M = 64, N = 32}>} {
+    %cst_input = arith.constant 2.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    // CHECK: %[[INPUT:.*]] = arith.constant dense<2.000000e+00> : vector<16xf32>
+    %input = wave.register %cst_input : vector<16xf32>
+    // CHECK: %[[INIT:.*]] = arith.constant dense<0.000000e+00> : vector<1xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // CHECK-NOT: wave.max_element
+    // CHECK: %[[INIT_ELEM:.*]] = vector.extract %[[INIT]][0] : f32 from vector<1xf32>
+    // CHECK: %[[THREAD_REDUCE:.*]] = vector.reduction <maximumf>, %[[INPUT]], %[[INIT_ELEM]] : vector<16xf32> into f32
+    // CHECK: gpu.all_reduce maximumf %[[THREAD_REDUCE]] {
+    // CHECK: } : (f32) -> f32
+    %result = wave.max_element %input init(%init) along @N <block> : (vector<16xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test warning when <block> but hardware constraint specifies only one wave per block.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @warn_block_reduction_single_wave
+  func.func @warn_block_reduction_single_wave()
+    attributes {wave.hyperparameters = #wave.hyperparameters<{M = 64}>,
+                wave.constraints = [#wave.hardware_constraint<threads_per_wave = 64, waves_per_block = [1, 1, 1]>]} {
+    %cst_input = arith.constant 1.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    %input = wave.register %cst_input : vector<8xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // expected-warning @below {{block reduction requested but hardware constraint specifies only one wave per block (waves_per_block = [1, 1, 1]); consider using wave-level reduction instead}}
+    %result = wave.sum %input init(%init) along @M <block> : (vector<8xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test warning when <warp> but hardware constraint specifies multiple waves per block.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @warn_wave_reduction_multiple_waves
+  func.func @warn_wave_reduction_multiple_waves()
+    attributes {wave.hyperparameters = #wave.hyperparameters<{M = 64}>,
+                wave.constraints = [#wave.hardware_constraint<threads_per_wave = 64, waves_per_block = [2, 2, 1]>]} {
+    %cst_input = arith.constant 1.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    %input = wave.register %cst_input : vector<8xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // expected-warning @below {{wave-level reduction requested but hardware constraint specifies multiple waves per block (waves_per_block = [2, 2, 1]); consider using block reduction to reduce across all waves}}
+    %result = wave.sum %input init(%init) along @M <warp> : (vector<8xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test warning for max_element with <block> and single wave.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @warn_block_max_single_wave
+  func.func @warn_block_max_single_wave()
+    attributes {wave.hyperparameters = #wave.hyperparameters<{N = 32}>,
+                wave.constraints = [#wave.hardware_constraint<threads_per_wave = 64, waves_per_block = [1, 1, 1]>]} {
+    %cst_input = arith.constant 2.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    %input = wave.register %cst_input : vector<16xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // expected-warning @below {{block reduction requested but hardware constraint specifies only one wave per block (waves_per_block = [1, 1, 1]); consider using wave-level reduction instead}}
+    %result = wave.max_element %input init(%init) along @N <block> : (vector<16xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test warning for max_element with <warp> and multiple waves.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @warn_wave_max_multiple_waves
+  func.func @warn_wave_max_multiple_waves()
+    attributes {wave.hyperparameters = #wave.hyperparameters<{N = 32}>,
+                wave.constraints = [#wave.hardware_constraint<threads_per_wave = 64, waves_per_block = [4, 1, 1]>]} {
+    %cst_input = arith.constant 2.0 : f32
+    %cst_init = arith.constant 0.0 : f32
+    %input = wave.register %cst_input : vector<16xf32>
+    %init = wave.register %cst_init : vector<1xf32>
+    // expected-warning @below {{wave-level reduction requested but hardware constraint specifies multiple waves per block (waves_per_block = [4, 1, 1]); consider using block reduction to reduce across all waves}}
+    %result = wave.max_element %input init(%init) along @N <warp> : (vector<16xf32>, vector<1xf32>) -> vector<1xf32>
+    return
+  }
+}
+
+// -----
+
+// Test wave.self_index lowering with unit stride - produces start + iota.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_self_index_unit_stride
+  func.func @lower_self_index_unit_stride() -> vector<4xi32> attributes {wave.hyperparameters = #wave.hyperparameters<{N = 64}>} {
+    // CHECK-NOT: wave.self_index
+    // CHECK: %[[TID:.*]] = gpu.thread_id  x
+    // CHECK: %[[START:.*]] = affine.apply
+    // CHECK: %[[IOTA:.*]] = vector.step : vector<4xindex>
+    // CHECK: %[[START_VEC:.*]] = vector.broadcast %[[START]] : index to vector<4xindex>
+    // CHECK: %[[ADD:.*]] = arith.addi %[[START_VEC]], %[[IOTA]] : vector<4xindex>
+    // CHECK: %[[RESULT:.*]] = arith.index_cast %[[ADD]] : vector<4xindex> to vector<4xi32>
+    // CHECK: return %[[RESULT]]
+    %0 = wave.self_index @N index [{N : <[#wave.index_symbol<T0>] -> (T0, 4, 1)>}] : vector<4xi32>
+    return %0 : vector<4xi32>
+  }
+}
+
+// -----
+
+// Test wave.self_index lowering with non-unit stride - produces start + iota * stride.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_self_index_with_stride
+  func.func @lower_self_index_with_stride() -> vector<4xi64> attributes {wave.hyperparameters = #wave.hyperparameters<{M = 128}>} {
+    // CHECK-NOT: wave.self_index
+    // CHECK: %[[TID:.*]] = gpu.thread_id  x
+    // CHECK: %[[START:.*]] = affine.apply
+    // CHECK: %[[IOTA:.*]] = vector.step : vector<4xindex>
+    // CHECK: %[[START_VEC:.*]] = vector.broadcast %[[START]] : index to vector<4xindex>
+    // CHECK: %[[C16:.*]] = arith.constant 16 : index
+    // CHECK: %[[STRIDE_VEC:.*]] = vector.broadcast %[[C16]] : index to vector<4xindex>
+    // CHECK: %[[SCALED:.*]] = arith.muli %[[IOTA]], %[[STRIDE_VEC]] : vector<4xindex>
+    // CHECK: %[[ADD:.*]] = arith.addi %[[START_VEC]], %[[SCALED]] : vector<4xindex>
+    // CHECK: %[[RESULT:.*]] = arith.index_cast %[[ADD]] : vector<4xindex> to vector<4xi64>
+    // CHECK: return %[[RESULT]]
+    %0 = wave.self_index @M index [{M : <[#wave.index_symbol<T0>] -> (T0 * 4, 4, 16)>}] : vector<4xi64>
+    return %0 : vector<4xi64>
+  }
+}
+
+// -----
+
+// Test wave.self_index lowering with complex start expression involving
+// workgroup and thread IDs.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_self_index_complex_start
+  func.func @lower_self_index_complex_start() -> vector<8xi32> attributes {wave.hyperparameters = #wave.hyperparameters<{M = 256, BLOCK_M = 64}>} {
+    // CHECK-NOT: wave.self_index
+    // CHECK-DAG: gpu.thread_id  x
+    // CHECK-DAG: gpu.block_id  x
+    // CHECK: affine.apply
+    // CHECK: vector.step : vector<8xindex>
+    // CHECK: arith.addi
+    // CHECK: arith.index_cast {{.*}} : vector<8xindex> to vector<8xi32>
+    %0 = wave.self_index @M index [{
+      M : <[#wave.index_symbol<WG0>, #wave.symbol<"BLOCK_M">, #wave.index_symbol<T0>] -> (WG0 * BLOCK_M + T0, 8, 1)>
+    }] : vector<8xi32>
+    return %0 : vector<8xi32>
+  }
+}
+
+// -----
+
+// Test wave.reshape lowering: multiple 1-element vectors to vector (vector.from_elements with extract).
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_reshape_single_elem_vectors_to_vector
+  func.func @lower_reshape_single_elem_vectors_to_vector() -> vector<3xf32> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %c0 = arith.constant 0.0 : f32
+    %v0 = wave.register %c0 : vector<1xf32>
+    %c1 = arith.constant 1.0 : f32
+    %v1 = wave.register %c1 : vector<1xf32>
+    %c2 = arith.constant 2.0 : f32
+    %v2 = wave.register %c2 : vector<1xf32>
+    // CHECK-NOT: wave.reshape
+    // CHECK: %[[ONE:.+]] = vector.extract %{{.*}}[0] : f32 from vector<1xf32>
+    // CHECK: %[[TWO:.+]] = vector.extract %{{.*}}[0] : f32 from vector<1xf32>
+    // CHECK: %[[THREE:.+]] = vector.extract %{{.*}}[0] : f32 from vector<1xf32>
+    // CHECK: vector.from_elements %[[ONE]], %[[TWO]], %[[THREE]] : vector<3xf32>
+    %0 = wave.reshape %v0, %v1, %v2 {target_vector_shape = {}} : vector<1xf32> to vector<3xf32>
+    return %0 : vector<3xf32>
+  }
+}
+
+// -----
+
+// Test wave.reshape lowering: multiple vectors concatenated (zeros + vector.insert_strided_slice).
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_reshape_concat_vectors
+  func.func @lower_reshape_concat_vectors() -> vector<8xf32> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %c0 = arith.constant 0.0 : f32
+    %v0 = wave.register %c0 : vector<4xf32>
+    %c1 = arith.constant 1.0 : f32
+    %v1 = wave.register %c1 : vector<4xf32>
+    // CHECK: %[[SLICE1:.+]] = arith.constant dense<0.000000e+00> : vector<4xf32>
+    // CHECK: %[[SLICE2:.+]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    // CHECK-NOT: wave.reshape
+    // CHECK: %[[ZEROS:.+]] = arith.constant dense<0.000000e+00> : vector<8xf32>
+    // CHECK: %[[ONE:.+]] = vector.insert_strided_slice %[[SLICE1]], %[[ZEROS]] {offsets = [0], strides = [1]}
+    // CHECK: vector.insert_strided_slice %[[SLICE2]], %[[ONE]] {offsets = [4], strides = [1]}
+    %0 = wave.reshape %v0, %v1 {target_vector_shape = {}} : vector<4xf32> to vector<8xf32>
+    return %0 : vector<8xf32>
+  }
+}
+
+// -----
+
+// Test wave.reshape lowering: multiple vectors concatenated (zeros + vector.insert_strided_slice), i16 element type.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_reshape_concat_vectors_i16
+  func.func @lower_reshape_concat_vectors_i16() -> vector<8xi16> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %c0 = arith.constant 0 : i16
+    %v0 = wave.register %c0 : vector<4xi16>
+    %c1 = arith.constant 1 : i16
+    %v1 = wave.register %c1 : vector<4xi16>
+    // CHECK: %[[SLICE1:.+]] = arith.constant dense<0> : vector<4xi16>
+    // CHECK: %[[SLICE2:.+]] = arith.constant dense<1> : vector<4xi16>
+    // CHECK-NOT: wave.reshape
+    // CHECK: %[[ZEROS:.+]] = arith.constant dense<0> : vector<8xi16>
+    // CHECK: %[[ONE:.+]] = vector.insert_strided_slice %[[SLICE1]], %[[ZEROS]] {offsets = [0], strides = [1]}
+    // CHECK: vector.insert_strided_slice %[[SLICE2]], %[[ONE]] {offsets = [4], strides = [1]}
+    %0 = wave.reshape %v0, %v1 {target_vector_shape = {}} : vector<4xi16> to vector<8xi16>
+    return %0 : vector<8xi16>
+  }
+}
+
+// -----
+
+// Test wave.reshape lowering: single source, extract slice (vector.extract_strided_slice).
+// Single-source case: offset = logical_slice * target_num_elements; extract that slice.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_reshape_extract_slice
+  func.func @lower_reshape_extract_slice() -> vector<4xf32> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %c0 = arith.constant 0.0 : f32
+    %vec = wave.register %c0 : vector<8xf32>
+    // CHECK-NOT: wave.reshape
+    // CHECK: vector.extract_strided_slice %{{.*}} {offsets = [4], sizes = [4], strides = [1]}
+    %0 = wave.reshape %vec {target_vector_shape = {}, logical_slice = 1, num_slices = 2} : vector<8xf32> to vector<4xf32>
+    return %0 : vector<4xf32>
+  }
+}
+
+// -----
+
+// Test wave.broadcast lowering: vector<1> to vector<8> produces vector.broadcast.
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_broadcast_vector1_to_vector8
+  func.func @lower_broadcast_vector1_to_vector8() -> vector<8xf32> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %c0 = arith.constant 0.0 : f32
+    %vec = wave.register %c0 : vector<1xf32>
+    // CHECK-NOT: wave.broadcast
+    // CHECK: %[[REG:.*]] = arith.constant dense<0.000000e+00> : vector<1xf32>
+    // CHECK: vector.broadcast %[[REG]] : vector<1xf32> to vector<8xf32>
+    %0 = wave.broadcast %vec : (vector<1xf32>) -> vector<8xf32>
+    return %0 : vector<8xf32>
+  }
+}
+
+// -----
+
+// Test wave.broadcast lowering: same source and result type is replaced by source (no vector.broadcast).
+normalform.module [#wave.normal_form<full_types,index_exprs,memory_only_types,resolved_allocations,ordered_syms>] {
+  // CHECK-LABEL: func.func @lower_broadcast_identity
+  func.func @lower_broadcast_identity() -> vector<4xf32> attributes {wave.hyperparameters = #wave.hyperparameters<{}>} {
+    %c0 = arith.constant 1.0 : f32
+    %vec = wave.register %c0 : vector<4xf32>
+    // CHECK-NOT: wave.broadcast
+    // CHECK-NOT: vector.broadcast
+    // CHECK: arith.constant dense<1.000000e+00> : vector<4xf32>
+    // CHECK: return
+    %0 = wave.broadcast %vec : (vector<4xf32>) -> vector<4xf32>
+    return %0 : vector<4xf32>
   }
 }

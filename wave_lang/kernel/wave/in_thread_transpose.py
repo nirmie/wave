@@ -12,11 +12,14 @@ from typing import Optional, Sequence
 
 import torch.fx as fx
 
+from wave_lang.kernel.lang import Register
+
 from .._support.indexing import IndexExpr, IndexSequence, IndexSymbol
 from .._support.tracing import CapturedTrace
 from ..lang.global_symbols import *
 from ..lang.wave_types import IndexMapping
 from ..ops.wave_ops import Extract, Read, Reshape, Write, get_custom
+from ..wave.utils.tag_utils import propagate_tag
 from ..wave.constraints import (
     Constraint,
     TilingConstraint,
@@ -126,7 +129,7 @@ class TransposeConfig:
     store_elems_per_thread: int
     src_symbolic_shape: Sequence[IndexSymbol]
     dst_symbolic_shape: Sequence[IndexSymbol]
-    materialized_shape: Sequence[IndexSymbol]
+    materialized_shape: list[int]
 
 
 def get_transpose_config(
@@ -288,7 +291,7 @@ def create_transpose_reads(
 def create_transpose_writes(
     write: Write,
     new_reads: list[Read],
-    materialized_shape: Sequence[IndexSymbol],
+    materialized_shape: Sequence[int],
     store_elems_per_thread: int,
     expected_number_of_stores: int,
     dst_symbolic_shape: Sequence[IndexSymbol],
@@ -313,11 +316,14 @@ def create_transpose_writes(
                 value = Extract(new_reads[j], [i]).add_to_graph(
                     write.graph, loc=write.location
                 )
+                propagate_tag(write.fx_node, value)
                 values.append(value)
 
             value = Reshape(values, store_elems_per_thread).add_to_graph(
                 write.graph, loc=write.location
             )
+            value.type = Register[(*dst_symbolic_shape, write.register_type.dtype)]
+            propagate_tag(write.fx_node, value)
             repacked.append(value)
 
     new_writes = defaultdict(list)

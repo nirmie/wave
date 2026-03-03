@@ -73,6 +73,8 @@ from ...ops.wave_ops import (
     lt,
     maximum,
     memory_counter_wait,
+    memory_counter_wait_barrier,
+    tensor_counter_wait,
     minimum,
     mma,
     ne,
@@ -585,12 +587,6 @@ def handle_atomic_op(op):
                     f"{op}\nGot\n"
                     f"lhs: {lhs_data_type} vs rhs: {rhs_data_type}\n"
                 )
-            if is_float_type(lhs_data_type):
-                # TODO: To support float types, MLIR LLVM dialect needs to be updated with
-                # float types. LLVM already supports fmin and fmax (https://llvm.org/docs/LangRef.html#atomicrmw-instruction)
-                # and thus atomicrmw operation in MLIR dialect needs to target those instructions with "workgroup" scope.
-                raise NotImplementedError(f"Atomic ops don't support float types yet\n")
-
             lhs = lhs.ir_value
             rhs = rhs.ir_value
             lhs_type = lhs.type
@@ -1516,14 +1512,26 @@ def handle_iterate(emitter: WaveEmitter, node: fx.Node):
     except ValueError as e:
         raise ValidationError("Malformed arguments") from e
 
-    if start:
+    if start is not None and condition is not None:
         return handle_iterate_while(emitter, node)
 
     # Flatten init_args and get IR values for each of them.
     flat_init_args, _ = pytree.tree_flatten((init_args))
     flat_init_args = [cast_py_value(emitter, arg) for arg in flat_init_args]
 
-    start = arith_d.constant(IndexType.get(), int(0))
+    # Use provided start value if available, otherwise default to 0
+    if start is not None:
+        start_value = cast_py_value(emitter, start).ir_value
+        # Handle the case where start is a symbolic expression
+        if isinstance(start_value.type, VectorType):
+            start_value = vector_d.extract(
+                start_value, static_position=[0], dynamic_position=[]
+            )
+        if isinstance(start_value.type, IntegerType):
+            start_value = arith_d.index_cast(IndexType.get(), start_value)
+        start = start_value
+    else:
+        start = arith_d.constant(IndexType.get(), int(0))
 
     # For now, we assume that dimensions that have tiling constraints on them,
     # do not have any other constraints.
@@ -1740,13 +1748,14 @@ def handle_shared_memory_barrier_signal(emitter: WaveEmitter, node: fx.Node):
     try:
         barId = node.args[0]
         tensor_wait = node.args[1]
+        ds_wait = node.args[2] if len(node.args) > 2 else True
     except ValueError as e:
         raise ValidationError("Malformed arguments") from e
 
     if tensor_wait:
         rocdl_d.s_wait_tensorcnt(0)
 
-    if barId != CLUSTER_BARRIER_ID:
+    if ds_wait and barId != CLUSTER_BARRIER_ID:
         rocdl_d.s_wait_dscnt(0)
 
     # For cluster barriers (barId == -3), only wave 0 should signal
@@ -1836,6 +1845,47 @@ def handle_memory_counter_wait(emitter: WaveEmitter, node: fx.Node):
         ds=to_attr(ds),
         exp=to_attr(exp),
     )
+
+
+@handle_op(memory_counter_wait_barrier)
+def handle_memory_counter_wait_barrier(emitter: WaveEmitter, node: fx.Node):
+    try:
+        load, store, ds, exp = node.args
+    except ValueError as e:
+        raise ValidationError("Malformed arguments") from e
+
+    i32 = IntegerType.get_signless(32)
+
+    def to_attr(v):
+        return None if v is None else get_constant_attr(v, i32)
+
+    # Emit memory counter wait
+    amdgpu_d.memory_counter_wait(
+        load=to_attr(load),
+        store=to_attr(store),
+        ds=to_attr(ds),
+        exp=to_attr(exp),
+    )
+
+    # Emit workgroup barrier
+    rocdl_d.s_barrier()
+
+
+@handle_op(tensor_counter_wait)
+def handle_tensor_counter_wait(emitter: WaveEmitter, node: fx.Node):
+    # TensorCounterWait is only supported on gfx12xx
+    if not emitter.options.target.startswith("gfx12"):
+        raise CodegenError(
+            f"TensorCounterWait (s_wait_tensorcnt) is only supported on gfx12xx, "
+            f"got target: {emitter.options.target}"
+        )
+
+    try:
+        count = node.args[0]
+    except ValueError as e:
+        raise ValidationError("Malformed arguments") from e
+
+    rocdl_d.s_wait_tensorcnt(count)
 
 
 @handle_op(workgroup_barrier)
@@ -2102,10 +2152,9 @@ def handle_permute(emitter: WaveEmitter, node: fx.Node):
 @handle_op(reshape)
 def handle_reshape(emitter: WaveEmitter, node: fx.Node):
     try:
-        args, target_vector_shapes = node.args
+        args, _, logical_slice, num_slices = node.args
     except ValueError as e:
         raise ValidationError("Malformed arguments") from e
-    custom = get_custom(node)
 
     # Determine whether to extract or combine.
     if len(args) > 1:
@@ -2149,16 +2198,10 @@ def handle_reshape(emitter: WaveEmitter, node: fx.Node):
     # actual offset, we need to multiply by the size. The size is obtained by
     # computing the number of partitions using the source and target vector shapes
     # and dividing the incoming vector shape by the number of partitions.
-    innermost_dim = custom.type.symbolic_shape[-1]
-    offset = custom.expanded_dims[innermost_dim]
-    num_partitions = (
-        target_vector_shapes[innermost_dim] // custom.vector_shapes[innermost_dim]
-    )
+    offset = logical_slice
     vector = cast_vector(emitter, args[0])
-    size = vector.type.shape[0] // num_partitions
+    size = vector.type.shape[0] // num_slices
     result_type = VectorType.get([size], vector.type.element_type)
-    # The offset should only be in [0, num_partitions - 1].
-    offset = offset % num_partitions
     slice = vector_d.extract_strided_slice(
         result_type,
         vector,

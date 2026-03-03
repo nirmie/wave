@@ -5,12 +5,12 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 """
-Benchmark script to compare ASM backend vs LLVM backend performance for GEMM kernels.
+Benchmark script to compare ASM, LLVM, and C++ backend performance for GEMM kernels.
 
 This script:
 1. Reads GEMM configuration from benchmark_configs.json
-2. Runs the GEMM kernel with both ASM and LLVM backends
-3. Verifies correctness of both backends against PyTorch reference
+2. Runs the GEMM kernel with ASM, LLVM, and optionally C++ backends
+3. Verifies correctness of all backends against PyTorch reference
 4. Reports performance metrics for comparison
 
 Example usage:
@@ -19,21 +19,30 @@ Example usage:
         --num_warmup 10 \
         --num_iterations 100
 
+    # Include C++ waveasm-translate backend
+    python -u wave_lang/kernel/wave/perf/benchmark_asm_backend.py \
+        --config wave_lang/kernel/wave/perf/benchmark_configs.json \
+        --cpp
+
 Note: Each wave handles a WAVE_M x WAVE_N tile, which can be larger than the MMA
 intrinsic size (16x16 for F32_16x16x16_F16). The wave internally performs multiple
 MMA operations to cover its tile. The number of waves per workgroup is determined
 by BLOCK_M/WAVE_M along M and BLOCK_N/WAVE_N along N.
+
+C++ Backend Requirements:
+  - waveasm-translate executable (set WAVEASM_TRANSLATE env var or build wave-asm)
+  - clang++ (built from LLVM or in PATH)
+  - wave_runtime Python module
 """
 
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional, Tuple
 
 import torch
 from torch.testing import assert_close
@@ -54,6 +63,12 @@ from wave_lang.kernel.wave.utils.run_utils import (
 from wave_lang.kernel.wave.utils.torch_utils import (
     device_randn,
     device_zeros,
+)
+from wave_lang.kernel.wave.perf.utils import (
+    ensure_rocprofv3,
+    find_rocprof_outputs,
+    get_rocprofv3_cmd,
+    rocprof_avg_ms_from_kernel_trace_last_n,
 )
 from wave_lang.support.logging import get_logger
 from wave_lang.support.location_config import (
@@ -124,6 +139,11 @@ Notes:
         help="Skip ASM backend benchmark (only run LLVM)",
     )
     parser.add_argument(
+        "--cpp",
+        action="store_true",
+        help="Include C++ waveasm-translate backend in benchmark",
+    )
+    parser.add_argument(
         "--use_schedule",
         action="store_true",
         help="Use manual scheduling with pipelining and wave staggering",
@@ -137,7 +157,7 @@ Notes:
     parser.add_argument(
         "--_backend",
         type=str,
-        choices=["asm", "llvm"],
+        choices=["asm", "llvm", "cpp"],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -321,6 +341,8 @@ def create_compile_options(
     config: dict,
     backend: str,
     use_schedule: bool = False,
+    skip_postprocess: bool = False,
+    use_global_to_shared: bool = False,
     **kwargs,
 ) -> WaveCompileOptions:
     """Create compile options for GEMM kernel.
@@ -331,8 +353,12 @@ def create_compile_options(
                 Supports both uppercase keys (M, N, K) and lowercase (m, n, k).
         backend: Either "asm" or "llvm"
         use_schedule: If True, use manual scheduling with pipelining
+        skip_postprocess: If True, skip the K-loop unrolling postprocess
+                          (needed for C++ backend which doesn't support unrolled loops)
+        use_global_to_shared: If True, enable use_global_to_shared optimization
+                              (needed for correct LDS allocation in some configs)
         **kwargs: Additional options to pass to WaveCompileOptions
-                  (e.g., dump_intermediates, use_global_to_shared)
+                  (e.g., dump_intermediates)
 
     Returns:
         Configured WaveCompileOptions
@@ -370,11 +396,16 @@ def create_compile_options(
         options_kwargs["schedule"] = SchedulingType.MANUAL
         # Enable GatherToLDS for proper scheduling with separate global/shared ops
         options_kwargs["use_global_to_shared"] = True
+    elif use_global_to_shared:
+        # Explicitly requested use_global_to_shared (e.g., for C++ backend)
+        options_kwargs["use_global_to_shared"] = True
     options = WaveCompileOptions(**options_kwargs)
     options = set_default_run_config(options)
 
     # Unroll the K-loop by factor of 2 for better performance
-    options.postprocess = """
+    # Note: Skip postprocess for C++ backend as it causes LDS size calculation issues
+    if not skip_postprocess:
+        options.postprocess = """
     module attributes {transform.with_named_sequence} {
         transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
             %0 = transform.structured.match ops{["scf.for"]} in %arg0 : (!transform.any_op) -> !transform.any_op
@@ -385,6 +416,167 @@ def create_compile_options(
     """
 
     return options
+
+
+# =============================================================================
+# C++ Backend Support
+# =============================================================================
+
+
+class CppBackendKernel:
+    """Callable wrapper for C++ backend compiled kernel."""
+
+    def __init__(
+        self,
+        gpu_func,
+        kernel_name: str,
+        lds_size: int,
+        grid: Tuple[int, int, int],
+        block: Tuple[int, int, int],
+    ):
+        self.gpu_func = gpu_func
+        self.kernel_name = kernel_name
+        self.lds_size = lds_size
+        self.grid = grid
+        self.block = block
+        self._wave_runtime = None
+
+    def _get_wave_runtime(self):
+        if self._wave_runtime is None:
+            import wave_runtime
+
+            self._wave_runtime = wave_runtime
+        return self._wave_runtime
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
+        """Execute the C++ backend kernel."""
+        wave_runtime = self._get_wave_runtime()
+
+        stream = torch.cuda.current_stream().cuda_stream
+        kernel_launch_info = wave_runtime.KernelLaunchInfo(
+            stream,  # stream
+            self.gpu_func,  # gpu_func
+            self.lds_size,  # shared_memory_bytes
+            self.grid[0],  # grid_dim_x
+            self.grid[1],  # grid_dim_y
+            self.grid[2],  # grid_dim_z
+            self.block[0],  # block_dim_x
+            self.block[1],  # block_dim_y
+            self.block[2],  # block_dim_z
+            1,  # cluster_dim_x
+            1,  # cluster_dim_y
+            1,  # cluster_dim_z
+        )
+
+        kernel_args = wave_runtime.Int64Vector(
+            [
+                a.data_ptr(),
+                b.data_ptr(),
+                c.data_ptr(),
+            ]
+        )
+
+        wave_runtime.launch(kernel_launch_info, kernel_args, [], [])
+
+
+def compile_and_run_cpp_backend(
+    kernel,
+    symbols,
+    shape_config: dict,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    output_dir: Optional[Path] = None,
+) -> CppBackendKernel:
+    """Compile and run GEMM kernel using C++ waveasm-translate backend.
+
+    This function uses the e2e test utilities to:
+    1. Capture MLIR and kernel launch info from Wave compiler
+    2. Compile MLIR using C++ waveasm-translate
+    3. Run the kernel using wave_runtime
+
+    Returns:
+        CppBackendKernel: A callable that can be invoked for repeated execution.
+    """
+    from wave_lang.kernel.wave.asm.waveasm_e2e import (
+        WaveASMCompiler,
+        capture_wave_kernel_info,
+    )
+
+    target = get_default_arch()
+
+    # Step 1: Capture MLIR and kernel launch info using Wave compiler
+    # Note: use_global_to_shared=True for correct LDS allocation on CDNA4
+    options = create_compile_options(
+        symbols,
+        shape_config,
+        "asm",
+        use_schedule=False,
+        use_global_to_shared=True,
+    )
+    kernel_info = capture_wave_kernel_info(options, kernel)
+
+    # Step 2: Compile MLIR using C++ backend
+    compiler = WaveASMCompiler(target=target, codeobj="5", keep_temp_files=True)
+    cpp_result = compiler.compile_full(
+        kernel_info.mlir_text, kernel_info.workgroup_size
+    )
+
+    if not cpp_result.success:
+        raise RuntimeError(
+            f"C++ backend compilation failed: {cpp_result.error_message}"
+        )
+
+    # Save assembly if output_dir specified
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "cpp_asm.s").write_text(cpp_result.asm_text)
+        (output_dir / "input.mlir").write_text(kernel_info.mlir_text)
+
+    # Step 3: Set up for execution using wave_runtime
+    try:
+        import wave_runtime
+    except ImportError:
+        raise RuntimeError(
+            "wave_runtime not available. Build with wave_runtime support."
+        )
+
+    wave_runtime.load_hip_functions()
+    kernel_name = cpp_result.get_kernel_name() or kernel_info.kernel_name
+    gpu_binary, gpu_func = wave_runtime.load_binary(
+        str(cpp_result.binary_path), kernel_name
+    )
+
+    # Use launch info from Wave compiler, with fallback for grid computation
+    # kernel_info.grid_size can be (1,1,1) when grid is computed dynamically
+    block = kernel_info.workgroup_size
+    lds_size = kernel_info.lds_size
+
+    # Compute grid from shape config (fallback when kernel_info.grid_size is trivial)
+    m = shape_config["M"]
+    n = shape_config["N"]
+    block_m = shape_config["BLOCK_M"]
+    block_n = shape_config["BLOCK_N"]
+    computed_grid = (m // block_m, n // block_n, 1)
+
+    grid = (
+        kernel_info.grid_size if kernel_info.grid_size != (1, 1, 1) else computed_grid
+    )
+
+    # Create callable wrapper
+    cpp_kernel = CppBackendKernel(
+        gpu_func=gpu_func,
+        kernel_name=kernel_name,
+        lds_size=lds_size,
+        grid=grid,
+        block=block,
+    )
+
+    # Run once with provided tensors
+    cpp_kernel(a, b, c)
+    torch.cuda.synchronize()
+
+    return cpp_kernel
 
 
 def compile_and_run_kernel(
@@ -405,7 +597,7 @@ def compile_and_run_kernel(
         kernel: The Wave kernel function
         symbols: Symbol tuple from create_gemm_kernel
         shape_config: Configuration dict with M, N, K, BLOCK_M, etc.
-        backend: Either "asm" or "llvm"
+        backend: Either "asm", "llvm", or "cpp"
         a: Input tensor A (M x K)
         b: Input tensor B (N x K)
         c: Output tensor C (M x N)
@@ -418,6 +610,18 @@ def compile_and_run_kernel(
     Returns:
         The compiled kernel function
     """
+    # C++ backend uses a separate compilation path
+    if backend == "cpp":
+        return compile_and_run_cpp_backend(
+            kernel,
+            symbols,
+            shape_config,
+            a,
+            b,
+            c,
+            output_dir=Path(mlir_dump_dir) / "cpp" if mlir_dump_dir else None,
+        )
+
     options = create_compile_options(
         symbols, shape_config, backend, use_schedule=use_schedule
     )
@@ -473,132 +677,6 @@ def compute_tflops(m: int, n: int, k: int, time_ms: float) -> float:
     return tflops
 
 
-def _csv_read(path: Path) -> list[dict[str, str]]:
-    import csv
-
-    with path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
-        return [dict(r) for r in reader]
-
-
-def _pick_column(sample_row: dict[str, str], candidates: list[str]) -> Optional[str]:
-    # Exact match first.
-    for c in candidates:
-        if c in sample_row:
-            return c
-    # Case-insensitive match next.
-    lowered = {k.lower(): k for k in sample_row.keys()}
-    for c in candidates:
-        if c.lower() in lowered:
-            return lowered[c.lower()]
-    return None
-
-
-def _parse_float(s: Any) -> float:
-    if s is None:
-        raise ValueError("Missing numeric field")
-    txt = str(s).strip()
-    if txt == "":
-        raise ValueError("Empty numeric field")
-    return float(txt)
-
-
-def _parse_int(s: Any) -> int:
-    if s is None:
-        raise ValueError("Missing integer field")
-    txt = str(s).strip()
-    if txt == "":
-        raise ValueError("Empty integer field")
-    return int(float(txt))
-
-
-def _find_rocprof_outputs(
-    output_dir: Path, prefix: str
-) -> tuple[Optional[Path], Optional[Path]]:
-    # Preferred files when --output-file is set:
-    #   <prefix>_kernel_stats.csv and <prefix>_kernel_trace.csv
-    stats = output_dir / f"{prefix}_kernel_stats.csv"
-    trace = output_dir / f"{prefix}_kernel_trace.csv"
-    if stats.exists() or trace.exists():
-        return (stats if stats.exists() else None, trace if trace.exists() else None)
-
-    # Fallback: best-effort search across rocprofv3 versions.
-    stats_matches = sorted(output_dir.glob("*kernel*_stats*.csv"))
-    trace_matches = sorted(output_dir.glob("*kernel*_trace*.csv"))
-    return (
-        stats_matches[0] if stats_matches else None,
-        trace_matches[0] if trace_matches else None,
-    )
-
-
-def _rocprof_avg_ms_from_kernel_trace_last_n(
-    trace_csv: Path, *, num_iterations: int
-) -> float:
-    """Compute average time (ms) for the last N dispatches of the most frequent kernel.
-
-    This avoids requiring ROCTx/marker ranges (which may not be available for the
-    Python version in use) by selecting the dominant repeatedly-called kernel and
-    averaging its last num_iterations dispatch durations.
-    """
-    rows = _csv_read(trace_csv)
-    if not rows:
-        raise ValueError(f"Empty rocprof trace: {trace_csv}")
-
-    kind_col = _pick_column(rows[0], ["Kind", "kind"])
-    name_col = _pick_column(
-        rows[0], ["Kernel_Name", "KernelName", "Kernel Name", "Name", "name"]
-    )
-    start_col = _pick_column(
-        rows[0], ["Start_Timestamp", "StartNs", "Start (ns)", "start_ns"]
-    )
-    end_col = _pick_column(rows[0], ["End_Timestamp", "EndNs", "End (ns)", "end_ns"])
-
-    if name_col is None or start_col is None or end_col is None:
-        raise ValueError(
-            f"Unexpected kernel trace schema in {trace_csv}. "
-            f"cols={list(rows[0].keys())}"
-        )
-
-    # Filter to kernel dispatch rows if "Kind" exists; otherwise assume all rows are kernels.
-    def is_kernel_row(r: dict[str, str]) -> bool:
-        if kind_col is None:
-            return True
-        return str(r.get(kind_col, "")).strip().upper() == "KERNEL_DISPATCH"
-
-    # Gather per-kernel durations in order.
-    per_kernel: dict[str, list[float]] = {}
-    for r in rows:
-        if not is_kernel_row(r):
-            continue
-        kname = str(r.get(name_col, "")).strip()
-        if not kname:
-            continue
-        start = _parse_float(r.get(start_col))
-        end = _parse_float(r.get(end_col))
-        dur_ns = end - start
-        if dur_ns < 0:
-            continue
-        per_kernel.setdefault(kname, []).append(dur_ns)
-
-    if not per_kernel:
-        raise ValueError(f"No kernel dispatch rows found in {trace_csv}")
-
-    # Choose the most frequent kernel as the benchmark target.
-    target_kernel = max(per_kernel.items(), key=lambda kv: len(kv[1]))[0]
-    durations = per_kernel[target_kernel]
-
-    if len(durations) < num_iterations:
-        raise ValueError(
-            f"Kernel trace has only {len(durations)} occurrences of selected kernel "
-            f"'{target_kernel}', expected at least {num_iterations}. "
-            f"Trace file: {trace_csv}"
-        )
-
-    tail = durations[-num_iterations:]
-    avg_ms = (sum(tail) / len(tail)) / 1e6
-    return avg_ms
-
-
 def _rocprofv3_benchmark_avg_ms(
     *,
     config_path: str,
@@ -608,10 +686,7 @@ def _rocprofv3_benchmark_avg_ms(
     num_iterations: int,
     use_schedule: bool = False,
 ) -> float:
-    rocprof = shutil.which("rocprofv3")
-    if not rocprof:
-        raise RuntimeError("rocprofv3 not found in PATH. Install ROCm/rocprofiler-sdk.")
-
+    rocprof = ensure_rocprofv3()
     script_path = os.path.abspath(__file__)
 
     with tempfile.TemporaryDirectory(prefix="wave_rocprofv3_") as tmpdir:
@@ -620,40 +695,33 @@ def _rocprofv3_benchmark_avg_ms(
             " ", "_"
         )
 
-        cmd = [
-            rocprof,
-            "--kernel-trace",
-            "--stats",
-            "--output-format",
-            "csv",
-            "--output-directory",
-            str(out_dir),
-            "--output-file",
-            prefix,
-            "--",
-            sys.executable,
-            script_path,
-            "--config",
-            config_path,
-            "--num_warmup",
-            str(num_warmup),
-            "--num_iterations",
-            str(num_iterations),
-            # Worker args:
-            "--_worker",
-            "--_backend",
-            backend,
-            "--_shape_name",
-            shape_name,
-        ]
+        prefix_args = get_rocprofv3_cmd(
+            out_dir, prefix, kernel_regex="", att_library_path=None
+        )
+        cmd = (
+            [rocprof]
+            + prefix_args[1:]
+            + [
+                sys.executable,
+                script_path,
+                "--config",
+                config_path,
+                "--num_warmup",
+                str(num_warmup),
+                "--num_iterations",
+                str(num_iterations),
+                "--_worker",
+                "--_backend",
+                backend,
+                "--_shape_name",
+                shape_name,
+            ]
+        )
         if use_schedule:
             cmd.append("--_use_schedule")
 
         env = os.environ.copy()
-        # Keep cache disabled for fair comparison.
         env["WAVE_CACHE_ON"] = "0"
-
-        # Keep rocprofv3 output noise down in normal runs.
         env.setdefault("ROCPROFILER_LOG_LEVEL", "error")
 
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -665,7 +733,7 @@ def _rocprofv3_benchmark_avg_ms(
                 f"stderr:\n{proc.stderr}\n"
             )
 
-        _stats_csv, trace_csv = _find_rocprof_outputs(out_dir, prefix)
+        _stats_csv, trace_csv = find_rocprof_outputs(out_dir, prefix)
         if trace_csv is None:
             present = sorted([p.name for p in out_dir.glob("*.csv")])
             raise RuntimeError(
@@ -676,8 +744,7 @@ def _rocprofv3_benchmark_avg_ms(
                 f"stderr:\n{proc.stderr}\n"
             )
 
-        # Compute average from the last N dispatches of the dominant kernel.
-        return _rocprof_avg_ms_from_kernel_trace_last_n(
+        return rocprof_avg_ms_from_kernel_trace_last_n(
             trace_csv,
             num_iterations=num_iterations,
         )
@@ -772,8 +839,8 @@ def _run_backend(
     m = shape_config["M"]
     n = shape_config["N"]
     k = shape_config["K"]
-    # Only apply schedule to ASM backend - LLVM always runs without schedule
-    # for fair comparison (LLVM without schedule is fastest)
+    # Only apply schedule to ASM backend - LLVM and C++ always run without schedule
+    # for fair comparison (LLVM/C++ without schedule is fastest)
     use_schedule = getattr(args, "use_schedule", False) and backend == "asm"
 
     if args.check_correctness:
@@ -891,34 +958,56 @@ def main():
                 logger.error(f"ASM backend failed: {e}")
                 results["asm"] = None
 
+        # Benchmark C++ backend if requested
+        if args.cpp:
+            logger.info("\n--- C++ Backend (waveasm-translate) ---")
+            try:
+                results["cpp"] = _run_backend(
+                    backend="cpp",
+                    args=args,
+                    shape_config=shape_config,
+                    a=a,
+                    b=b,
+                    expected=expected,
+                )
+            except Exception as e:
+                logger.error(f"C++ backend failed: {e}")
+                results["cpp"] = None
+
         # Summary comparison
         logger.info("\n" + "=" * 80)
         logger.info("Summary")
         logger.info("=" * 80)
 
-        if results.get("llvm") and results.get("asm"):
-            speedup = results["llvm"]["time_ms"] / results["asm"]["time_ms"]
-            logger.info(
-                f"LLVM: {results['llvm']['time_ms']:.4f} ms "
-                f"({results['llvm']['tflops']:.4f} TFLOPs)"
-            )
-            logger.info(
-                f"ASM:  {results['asm']['time_ms']:.4f} ms "
-                f"({results['asm']['tflops']:.4f} TFLOPs)"
-            )
-            logger.info(f"ASM speedup over LLVM: {speedup:.2f}x")
-        elif results.get("llvm"):
-            logger.info(
-                f"LLVM: {results['llvm']['time_ms']:.4f} ms "
-                f"({results['llvm']['tflops']:.4f} TFLOPs)"
-            )
-        elif results.get("asm"):
-            logger.info(
-                f"ASM: {results['asm']['time_ms']:.4f} ms "
-                f"({results['asm']['tflops']:.4f} TFLOPs)"
-            )
-        else:
-            logger.error("Both backends failed!")
+        # Print results for all available backends
+        for backend_name in ["llvm", "asm", "cpp"]:
+            if results.get(backend_name):
+                backend_upper = backend_name.upper() if backend_name != "cpp" else "C++"
+                logger.info(
+                    f"{backend_upper}: {results[backend_name]['time_ms']:.4f} ms "
+                    f"({results[backend_name]['tflops']:.4f} TFLOPs)"
+                )
+
+        # Compute speedups relative to LLVM
+        if results.get("llvm"):
+            llvm_time = results["llvm"]["time_ms"]
+            if results.get("asm"):
+                asm_speedup = llvm_time / results["asm"]["time_ms"]
+                logger.info(f"ASM speedup over LLVM: {asm_speedup:.2f}x")
+            if results.get("cpp"):
+                cpp_speedup = llvm_time / results["cpp"]["time_ms"]
+                logger.info(f"C++ speedup over LLVM: {cpp_speedup:.2f}x")
+
+        # Compare ASM to C++ if both available
+        if results.get("asm") and results.get("cpp"):
+            asm_vs_cpp = results["cpp"]["time_ms"] / results["asm"]["time_ms"]
+            if asm_vs_cpp > 1:
+                logger.info(f"ASM speedup over C++: {asm_vs_cpp:.2f}x")
+            else:
+                logger.info(f"C++ speedup over ASM: {1/asm_vs_cpp:.2f}x")
+
+        if not any(results.values()):
+            logger.error("All backends failed!")
 
         logger.info("")
 

@@ -94,6 +94,8 @@ class WaveCompileOptions:
     linearize_shared_access: bool = False
     scalarize_packed_math: bool = False
     coalescing_strategy_hint: CoalescingType = CoalescingType.LINEAR
+    enable_swizzle: bool = True
+    enable_mark_hardware_transpose_candidates: bool = True
 
     # === Compiler options ===
     minimize_shared_allocs: bool = True
@@ -125,6 +127,9 @@ class WaveCompileOptions:
 
     # === ASM backend options ===
     compile_to_asm: bool = (
-        False  # Compile to AMDGCN assembly (for lit tests, no amdclang++)
+        False  # Compile to AMDGCN assembly (for lit tests, no clang++)
+    )
+    use_wave_asm_backend: bool = (
+        False  # Use WaveASM (waveasm-translate) instead of Python backend
     )
     mma_type: Optional["MMAType"] = None  # MMA type for ASM backend dispatch

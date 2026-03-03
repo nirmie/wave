@@ -99,7 +99,16 @@ def read_meets_hw_transpose_requirements(
     if read.has_identity_mapping():
         return False
 
-    if len(list(read.index.keys())) != 2:
+    # Check effective dimensions (those with vector_shape > 0)
+    # This allows 4D attention tensors where B and H have vector_shape=0
+    # If vector_shapes is None, fall back to checking all index dimensions
+    if read.vector_shapes is not None:
+        effective_dims = [
+            dim for dim in read.index.keys() if read.vector_shapes.get(dim, 0) > 0
+        ]
+    else:
+        effective_dims = list(read.index.keys())
+    if len(effective_dims) != 2:
         return False
 
     bitwidth = read.type.dtype.bitwidth()
@@ -129,7 +138,7 @@ def allocate(
 
 
 def self_index(
-    dim: IndexExpr,
+    dim: IndexSymbol,
     dtype: DataType,
     elements_per_thread: Optional[IndexExpr | int] = None,
 ) -> "Register": ...
@@ -155,13 +164,21 @@ def set_wave_prio(priority: int): ...
 def shared_memory_barrier(wait_async_ops: bool = False): ...
 
 
-def shared_memory_barrier_signal(barId: int = 0, tensor_wait: bool = False): ...
+def shared_memory_barrier_signal(
+    barId: int = 0, tensor_wait: bool = False, ds_wait: bool = True
+): ...
 
 
 def shared_memory_barrier_wait(barId: int = 0): ...
 
 
 def memory_counter_wait(load=None, store=None, ds=None, exp=None): ...
+
+
+def memory_counter_wait_barrier(load=None, store=None, ds=None, exp=None): ...
+
+
+def tensor_counter_wait(count: int = 0): ...
 
 
 def workgroup_barrier(): ...
@@ -596,6 +613,43 @@ def get_custom(node: fx.Node) -> "CustomOp":
     return Unknown.from_fx_node(node)
 
 
+def tag(expr: fx.Proxy, tag_name: str) -> fx.Proxy:
+    """
+    Assign a tag to the result of a Python expression (e.g., arithmetic operators).
+
+    This function allows tagging operations that don't natively support the tag= keyword,
+    such as Python arithmetic operators (*, -, +, /).
+
+    Usage:
+        # Instead of:
+        result = a * b  # Cannot tag this directly
+
+        # Use:
+        result = tkw.tag(a * b, "multiply_ab")
+
+        # The tag can then be used in wave_schedule:
+        multiply_ops = tkw.get_node_by_tag("multiply_ab")
+
+    Args:
+        expr: The fx.Proxy result of an expression (e.g., a * b, x - y)
+        tag_name: The tag string to assign to the operation
+
+    Returns:
+        The same fx.Proxy, allowing chained expressions
+    """
+    tag_set = {tag_name} if isinstance(tag_name, str) else tag_name
+    if isinstance(expr, fx.Proxy):
+        expr.node.tag = tag_set
+    elif isinstance(expr, fx.Node):
+        expr.tag = tag_set
+    else:
+        raise ValueError(
+            f"tkw.tag expects an fx.Proxy or fx.Node, got {type(expr)}. "
+            "Make sure you're tagging the result of a traced operation."
+        )
+    return expr
+
+
 def has_same_custom_type(lhs_type: Memory, rhs_type: Memory) -> bool:
     same_shape = lhs_type.symbolic_shape == rhs_type.symbolic_shape
     same_dtype = lhs_type.dtype == rhs_type.dtype
@@ -606,12 +660,84 @@ def has_same_custom_type(lhs_type: Memory, rhs_type: Memory) -> bool:
 class CustomOp(ABC):
     """
     Base class for all custom fx nodes.
+
+    Fields with ``compare=False`` are infrastructure or scheduling artifacts
+    and do not participate in semantic equality used for trace equivalence.
     """
 
-    graph: Optional[fx.Graph] = field(default=None, init=False)
-    fx_node: Optional[fx.Node] = field(default=None, init=False)
+    graph: Optional[fx.Graph] = field(default=None, init=False, compare=False)
+    fx_node: Optional[fx.Node] = field(default=None, init=False, compare=False)
     tkw_op_name: str = field(default="unknown", init=False)
-    _tracing_function: Optional[Callable[..., Any]] = field(default=None, init=False)
+    _tracing_function: Optional[Callable[..., Any]] = field(
+        default=None, init=False, compare=False
+    )
+
+    @classmethod
+    def create(
+        cls: Type[CustomOpT],
+        graph: fx.Graph,
+        *args,
+        type: Any = None,
+        extra_attrs: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> CustomOpT:
+        """
+        Create a CustomOp instance and its FX node together.
+
+        This classmethod properly instantiates the CustomOp with its semantic fields,
+        creates the FX node, and links them together. Useful when building FX graphs
+        programmatically (e.g., from MLIR).
+
+        Args:
+            graph: FX graph to add the node to.
+            *args: Positional arguments for the dataclass constructor.
+            type: Optional type to set on the node.
+            extra_attrs: Additional attributes to set on the fx_node after
+                creation (e.g., index, vector_shapes).  These are not passed
+                to the dataclass constructor.
+            **kwargs: Keyword arguments forwarded to the dataclass
+                constructor.
+
+        Returns:
+            The created CustomOp instance with fx_node and graph fields populated.
+
+        Example:
+            register = NewRegister.create(
+                graph, dims, dtype, init_value,
+                type=Register[(M, N, f32)],
+                extra_attrs={"vector_shapes": {M: 16, N: 16}},
+            )
+        """
+        assert cls._tracing_function is not None, (
+            f"{cls.__name__} has no _tracing_function; "
+            f"ensure @define_op decorates the class"
+        )
+
+        # Create the CustomOp instance with its semantic fields
+        instance = cls(*args, **kwargs)
+
+        # Create the FX node
+        fx_node = graph.create_node(
+            "call_function",
+            target=cls._tracing_function,
+            args=args,
+            kwargs=kwargs,
+        )
+        fx_node.tkw_op = cls
+        fx_node.tkw_op_name = cls.tkw_op_name
+        if type is not None:
+            fx_node.type = type
+
+        # Link the instance and node
+        instance.fx_node = fx_node
+        instance.graph = graph
+
+        # Set any extra attributes on the fx_node
+        for attr_name, attr_value in (extra_attrs or {}).items():
+            if attr_value is not None:  # Skip None values
+                setattr(fx_node, attr_name, attr_value)
+
+        return instance
 
     @property
     def location(self) -> Optional[CapturedLocation]:
@@ -623,8 +749,20 @@ class CustomOp(ABC):
             setattr(self.fx_node, "location", value)
 
     @property
-    def tag(self) -> Optional[str]:
-        return getattr(self.fx_node, "tag", None)
+    def tag(self) -> Optional[set[str]]:
+        tag = getattr(self.fx_node, "tag", None)
+        # Normalize legacy string tags to sets
+        if isinstance(tag, str):
+            return {tag}
+        return tag
+
+    @tag.setter
+    def tag(self, value: Optional[str | set[str]]):
+        if value is None:
+            return
+        if isinstance(value, str):
+            value = {value}
+        setattr(self.fx_node, "tag", value)
 
     @property
     def unroll_iteration(self) -> Optional[int]:
@@ -638,7 +776,7 @@ class CustomOp(ABC):
 
     @classmethod
     def from_fx_node(cls: Type[CustomOpT], node: fx.Node) -> CustomOpT:
-        instance = cls(*node.args)
+        instance = cls(*node.args, **node.kwargs)
         instance.fx_node = node
         instance.graph = node.graph
         if hasattr(node, "index"):
@@ -1278,7 +1416,7 @@ class Output(CustomOp):
     traced function.
     """
 
-    return_vals: Sequence[Any]
+    return_vals: Sequence[Any] = field(compare=False)
     tkw_op_name: str = field(default="output", init=False)
 
     @classmethod
@@ -1305,6 +1443,14 @@ class Output(CustomOp):
         return self.fx_node
 
     @property
+    def yielded_values(self) -> list[Any]:
+        """Yielded values as a list."""
+        inner = self.return_vals[0]
+        if not isinstance(inner, Sequence):
+            return [inner]
+        return list(inner)
+
+    @property
     def has_side_effects(self) -> bool:
         return True
 
@@ -1315,7 +1461,7 @@ class Placeholder(CustomOp):
     Represents a placeholder node in the graph, i.e. an input to a function.
     """
 
-    _name: str
+    _name: str = field(compare=False)
     _type: Optional[Type[DataType] | Type[Memory]] = None
     tkw_op_name: str = field(default="placeholder", init=False)
 
@@ -1448,7 +1594,7 @@ class Allocate(CustomOp):
     padding: int = 0
     parent: Optional[fx.Node] = None
     offset: Optional[IndexExpr] = None
-    tail_padding: int = 0  # Padding after the array end
+    tail_padding: int = 0
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
@@ -1491,8 +1637,13 @@ class Allocate(CustomOp):
 
     @property
     def unpadded_shape(self) -> tuple[IndexExpr]:
+        from ..wave.utils.general_utils import infer_dim, is_scaled_dim
+
         unpadded_dims = self.unpadded_dims
-        return tuple(unpadded_dims[s] for s in self.shape)
+        # Normalize scaled dimensions (like K/2) to base dimensions (like K) for lookup
+        return tuple(
+            unpadded_dims[infer_dim(s) if is_scaled_dim(s) else s] for s in self.shape
+        )
 
     def infer_type(self, *args):
         type_expr = Memory[(*self.shape, self.address_space, self.dtype)]
@@ -1502,7 +1653,7 @@ class Allocate(CustomOp):
 @define_op("self_index")
 @dataclass
 class SelfIndex(CustomOp):
-    dim: IndexExpr
+    dim: IndexSymbol
     dtype: DataType
     elements_per_thread: Optional[IndexExpr | int] = None
 
@@ -1557,10 +1708,16 @@ class SharedMemoryBarrierSignal(CustomOp):
     -1:     works as s_barrier
     -2:     trap barrier
     -3:     cluster barrier
+
+    Parameters:
+        barId: The barrier ID to signal
+        tensor_wait: If True, emit s_wait_tensorcnt(0) before signaling
+        ds_wait: If True, emit s_wait_dscnt(0) before signaling (for non-cluster barriers)
     """
 
     barId: int = 0
     tensor_wait: bool = False
+    ds_wait: bool = True
 
     @property
     def has_side_effects(self) -> bool:
@@ -1627,6 +1784,10 @@ class AtomicOp(BinaryOpBase):
     def memory_type(self) -> "Memory":
         return get_custom(self.rhs).type
 
+    @property
+    def has_side_effects(self) -> bool:
+        return True
+
 
 @define_op("atomic_add")
 @dataclass
@@ -1654,12 +1815,53 @@ class MemoryCounterWait(CustomOp):
     """
     Wait for the specified counters to be less-than or equal-to
     the provided values before continuing.
+
+    Emits: amdgpu.memory_counter_wait with specified counters
     """
 
     load: Optional[int] = None
     store: Optional[int] = None
     ds: Optional[int] = None
     exp: Optional[int] = None
+
+    @property
+    def has_side_effects(self) -> bool:
+        return True
+
+
+@define_op("memory_counter_wait_barrier")
+@dataclass
+class MemoryCounterWaitBarrier(CustomOp):
+    """
+    Wait for the specified counters to be less-than or equal-to
+    the provided values before continuing, then perform a workgroup barrier.
+
+    Emits:
+    - amdgpu.memory_counter_wait with specified counters
+    - rocdl.s.barrier for workgroup synchronization
+    """
+
+    load: Optional[int] = None
+    store: Optional[int] = None
+    ds: Optional[int] = None
+    exp: Optional[int] = None
+
+    @property
+    def has_side_effects(self) -> bool:
+        return True
+
+
+@define_op("tensor_counter_wait")
+@dataclass
+class TensorCounterWait(CustomOp):
+    """
+    Wait for the tensor counter to reach the specified value.
+    Generates rocdl.s.wait.tensorcnt instruction.
+
+    NOTE: This operation is only supported on gfx1250 targets.
+    """
+
+    count: int = 0
 
     @property
     def has_side_effects(self) -> bool:
@@ -1771,7 +1973,7 @@ class MMA(MMABase):
     @property
     def acc_index(self) -> dict[IndexSymbol, IndexSequence]:
         operand_map = {MMA_LHS: 0, MMA_RHS: 0, MMA_ACC: 1}
-        if self.acc_type is None:
+        if self.acc_type is None or self.index is None:
             return None
         return self.operand_index(operand_map, self.acc_type.symbolic_shape)
 
@@ -1904,7 +2106,7 @@ class ScaledMMA(MMABase):
             MMA_LHS_SCALE: 0,
             MMA_RHS_SCALE: 0,
         }
-        if self.acc_type is None:
+        if self.acc_type is None or self.index is None:
             return None
         return self.operand_index(operand_map, self.acc_type.symbolic_shape)
 
@@ -1960,7 +2162,7 @@ class Read(CustomOp):
     flags: MemoryAccessFlags = MemoryAccessFlags.NONE
     source: Optional[tuple[IndexExpr]] = None
     target: Optional[tuple[IndexExpr]] = None
-    _write_dependency: Optional[list[fx.Node]] = None
+    _write_dependency: Optional[list[fx.Node]] = field(default=None, compare=False)
 
     @property
     def indexing_dims(self) -> list[IndexSymbol]:
@@ -2170,7 +2372,7 @@ class NestedRegionOp(CustomOp):
 
         output = get_custom(graph.output_node())
         assert isinstance(output, Output), f"Expected Output, but got {output}"
-        return output.return_vals[0]
+        return output.yielded_values
 
     def infer_type(self, *args):
         if self.init_args is not None:
@@ -2248,8 +2450,8 @@ class Conditional(NestedRegionOp):
     """
 
     condition: fx.Proxy | IndexExpr
-    subgraph_name: str
-    implicit_captures: Sequence[fx.Proxy]
+    subgraph_name: str = field(compare=False)
+    implicit_captures: Sequence[fx.Proxy] = field(compare=False)
     else_return: Optional[Sequence["Register"]] = None
 
     @property
@@ -2270,10 +2472,7 @@ class Conditional(NestedRegionOp):
             subgraph = self.get_root_graph().subgraphs[self.subgraph_name]
             return_node = get_custom(subgraph.output_node())
             assert isinstance(return_node, Output)
-            return_vals = return_node.return_vals[0]
-            if not isinstance(return_vals, Sequence):
-                return_vals = [return_vals]
-            for return_val in return_vals:
+            for return_val in return_node.yielded_values:
                 return_dims = get_custom(return_val).indexing_dims
                 expand_dims.append(return_dims)
             if len(expand_dims) == 1:
@@ -2290,8 +2489,8 @@ class Conditional(NestedRegionOp):
 class Iterate(NestedRegionOp):
     axis: IndexSymbol
     init_args: Sequence[Any]
-    subgraph_name: str
-    implicit_captures: Sequence[fx.Proxy]
+    subgraph_name: str = field(compare=False)
+    implicit_captures: Sequence[fx.Proxy] = field(compare=False)
     step: int = 1
     start: Optional[IndexExpr] = None
     condition: Optional[IndexExpr] = None
@@ -2302,10 +2501,7 @@ class Iterate(NestedRegionOp):
         subgraph = self.get_root_graph().subgraphs[self.subgraph_name]
         return_node = get_custom(subgraph.output_node())
         assert isinstance(return_node, Output)
-        return_vals = return_node.return_vals[0]
-        if not isinstance(return_vals, Sequence):
-            return_vals = [return_vals]
-        for return_val in return_vals:
+        for return_val in return_node.yielded_values:
             return_dims = get_custom(return_val).indexing_dims
             reduced_dims = [dims for dims in return_dims if dims != self.axis]
             expand_dims.append(reduced_dims)
@@ -2314,23 +2510,26 @@ class Iterate(NestedRegionOp):
         return expand_dims
 
     @property
-    def index(self) -> list[dict[IndexSymbol, IndexSequence]]:
+    def index(self) -> list[dict[IndexSymbol, IndexSequence] | None]:
+        """Collect indices from the subgraph's output return values.
+
+        Always returns a list with one entry per return value.  Uses
+        getattr with a None default so this is safe to call on
+        partially-populated graphs where indices have not been propagated
+        yet.
+        """
         subgraph = self.get_root_graph().subgraphs[self.subgraph_name]
         output = get_custom(subgraph.output_node())
         assert isinstance(output, Output)
-        return_vals = output.return_vals[0]
-        return (
-            [
-                (
-                    get_custom(val).acc_index
-                    if isinstance(get_custom(val), (MMA, ScaledMMA))
-                    else val.index
-                )
-                for val in return_vals
-            ]
-            if isinstance(return_vals, (Sequence))
-            else return_vals.index
-        )
+        result = []
+        for val in output.yielded_values:
+            custom_val = get_custom(val)
+            if isinstance(custom_val, (MMA, ScaledMMA)):
+                idx = getattr(custom_val, "acc_index", None)
+            else:
+                idx = getattr(val, "index", None)
+            result.append(idx)
+        return result
 
     @index.setter
     def index(self, value: Any):
@@ -3144,17 +3343,26 @@ class Reshape(CustomOp, ABC):
     Represents a reshape operation that reshapes
     vectors along the same dimension.
 
+    Conceptually, this either concatenates multiple vectors into a single vector
+    or extracts slices from the vector. Since this operation appears after
+    graph expansion, it never actually has multiple results: each expanded
+    instance of this operation extracts a single slice.
     """
 
     args: fx.Node | Sequence[fx.Node]
     target_vector_shape: dict[IndexSymbol, int]
+    logical_slice: int = 0
+    num_slices: int = 1
 
     @property
     def indexing_dims(self) -> list[IndexExpr]:
-        return get_custom(_to_sequence(self.args)[0]).indexing_dims
+        if not self.type:
+            return get_custom(_to_sequence(self.args)[0]).indexing_dims
+        return list(self.type.symbolic_shape)
 
     def infer_type(self, *args):
-        self.type = get_custom(_to_sequence(self.args)[0]).type
+        if not self.type:
+            self.type = get_custom(_to_sequence(self.args)[0]).type
 
 
 @define_op("tensor_load_to_lds")
