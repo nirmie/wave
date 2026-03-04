@@ -10,6 +10,7 @@
 
 #include "water/Dialect/Wave/IR/WaveAttrs.h"
 
+#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -51,6 +52,30 @@ std::optional<llvm::SmallVector<int64_t>>
 evaluateMapWithHyperparams(mlir::AffineMap map,
                            llvm::ArrayRef<mlir::Attribute> symbols,
                            wave::WaveHyperparameterAttr hyperparams);
+
+/// Compute waves per block from wave constraints and workgroup constraints.
+/// Returns failure if the computation fails.
+llvm::LogicalResult computeWavesPerBlockFromConstraints(
+    const llvm::SmallDenseMap<wave::WaveSymbolAttr,
+                              wave::WorkgroupConstraintAttr>
+        &workgroupConstraints,
+    const llvm::SmallDenseMap<wave::WaveSymbolAttr, wave::WaveConstraintAttr>
+        &waveConstraints,
+    wave::WaveHyperparameterAttr hyperparams,
+    llvm::SmallVectorImpl<unsigned> &wavesPerBlock);
+
 } // namespace wave
+
+namespace llvm {
+// Combine two potentially failing ChangeResults: if any of them failed, the
+// result of the combination is also failure.
+llvm::FailureOr<mlir::ChangeResult> static inline
+operator|(llvm::FailureOr<mlir::ChangeResult> lhs,
+          FailureOr<mlir::ChangeResult> rhs) {
+  if (llvm::failed(lhs) || llvm::failed(rhs))
+    return llvm::failure();
+  return *lhs | *rhs;
+}
+} // namespace llvm
 
 #endif // WATER_DIALECT_WAVE_IR_WAVEUTILS_H

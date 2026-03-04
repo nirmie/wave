@@ -6,6 +6,7 @@
 
 import math
 
+import torch.fx as fx
 from wave_lang.support.logging import get_logger
 
 from .._support.tracing import CapturedTrace
@@ -20,18 +21,19 @@ logger = get_logger("wave.promotion")
 
 
 def apply_padding(
-    shape: tuple[IndexSymbol | int], dtype: DataType
+    shape: tuple[IndexSymbol | int], dtype: DataType, padding_bits: int = 64
 ) -> tuple[int, tuple[IndexSymbol | int]]:
     """
     When accessing shared memory, we need to be cognizant of bank conflicts
     that can have a significant impact on performance. One way to mitigate
     these conflicts is by applying padding to the shared memory allocation.
-    This function applies padding of 64 bits to the shared memory allocation.
+    This function applies padding to the shared memory allocation based on
+    the provided padding_bits value.
     While this approach accomplishes the goal of reducing bank conflicts, it
     is inefficient in terms of memory usage. A more sophisticated approach
     would involve swizzling of the shared memory access patterns.
     """
-    padding = 64 // dtype.bitwidth()
+    padding = padding_bits // dtype.bitwidth()
     return padding, tuple(
         value + padding if i == len(shape) - 1 else value
         for i, value in enumerate(shape)
@@ -80,7 +82,9 @@ def apply_promotion_pattern(
             get_custom(memory).type.address_space != allocate_node.address_space
         ):
             # Moves memory to top of graph after allocate to avoid non-dominating operands.
-            move_node_after(custom_node.memory, allocate_node.fx_node)
+            # Skip if the memory already precedes the allocate (e.g. top-of-graph placeholders).
+            if custom_node.memory > allocate_node.fx_node:
+                move_node_after(custom_node.memory, allocate_node.fx_node)
             # We move CustomOp/Read up to the last write_to_shared_mem S.T
             # all reads from shared mem happens only after all read from globals
             # and write to shared mem happen. Which will minimize lds_barrier count.
@@ -165,12 +169,24 @@ def fix_manual_allocate_dependencies(trace: CapturedTrace):
                 logger.debug(f"Set write dependency for {node} to {writes_before}")
 
 
+def _last_placeholder_or_root(graph: fx.Graph) -> fx.Node:
+    """Return the last placeholder of the placeholder block at the top of the graph."""
+    last = graph._root
+    for node in graph.nodes:
+        if isinstance(get_custom(node), Placeholder):
+            last = node
+        else:
+            break
+    return last
+
+
 def promote_node(
     node: Read | Write,
     last_write_to_shared: fx.Node,
     address_space: IndexSymbol,
     constraints: list[Constraint],
     reorder_allocs: bool = True,
+    padding_bits: int = 64,
 ):
     """Promotes the given operand in the provided graph
     to the specified address space.
@@ -184,14 +200,16 @@ def promote_node(
     # If the read is a gather, then we should use the memory type instead of the
     # type, when determining the shape of the promoted memory.
     symbolic_shape = node.type.symbolic_shape
-    with node.graph.inserting_after(node.graph._root):
+    with node.graph.inserting_after(_last_placeholder_or_root(node.graph)):
         constrained_shape = get_constrained_shape(symbolic_shape, constraints)
         # If the read/write operation already has a set distributed shape at the kernel
         # we use that for allocation. Otherwise deduce the shape from constraints.
         memory_node = get_custom(node.memory)
         if isinstance(memory_node, Allocate) and memory_node.distributed_shape:
             constrained_shape = memory_node.distributed_shape
-        padding, padded_shape = apply_padding(constrained_shape, node.type.dtype)
+        padding, padded_shape = apply_padding(
+            constrained_shape, node.type.dtype, padding_bits
+        )
         allocate_node = Allocate(
             symbolic_shape, padded_shape, node.type.dtype, address_space, padding
         )
@@ -206,7 +224,11 @@ def promote_placeholders(
     graph: CapturedTrace,
     constraints: list[Constraint],
     reorder_allocs: bool = True,
+    target: str | None = None,
 ):
+    # Use 128-bit padding for gfx12* targets, 64-bit for others
+    padding_bits = 128 if target and target.startswith("gfx12") else 64
+
     read_or_write_nodes = graph.walk(
         lambda node: isinstance(get_custom(node), Read)
         or isinstance(get_custom(node), Write)
@@ -224,6 +246,7 @@ def promote_placeholders(
                 address_space,
                 constraints,
                 reorder_allocs,
+                padding_bits,
             )
 
     # Fix write dependencies for user-created allocations

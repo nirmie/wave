@@ -4,6 +4,7 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+from collections.abc import Sequence
 from copy import deepcopy
 from itertools import groupby
 from operator import itemgetter
@@ -17,6 +18,7 @@ from wave_lang.support.logging import get_logger
 from ..._support.indexing import IndexSequence, IndexSymbol
 from ..._support.tracing import CapturedTrace
 from ...lang.global_symbols import *
+from ...lang.wave_types import IndexMapping
 from ...ops.wave_ops import (
     CustomOp,
     ExtractSlice,
@@ -26,18 +28,23 @@ from ...ops.wave_ops import (
     Write,
     get_custom,
 )
-from ..constraints import (
-    Constraint,
-)
+from ..assumptions import Assumption
+from ..constraints import Constraint
+from ..utils.tag_utils import propagate_tag
 from ..utils.general_utils import (
     all_equal,
     get_fastest_index,
+    get_hardware_constraint,
     get_largest_index_and_size,
+    infer_dim,
 )
 from ..utils.mma_utils import (
     simplify_index,
 )
 from ..utils.symbol_utils import (
+    _numeric_eval_constant,
+    safe_subs,
+    simplify as sym_simplify,
     subs_idxc,
 )
 
@@ -48,8 +55,9 @@ def get_vector_shape(
     vector_shapes: dict[IndexSymbol, int],
     symbolic_shape: list[IndexSymbol],
 ) -> list[int]:
-    vector_shapes = [max(vector_shapes[dim], 1) for dim in symbolic_shape]
-    return vector_shapes
+    # Normalize scaled dimensions (like K/2) to base dimensions (like K) for lookup
+    result = [max(vector_shapes.get(infer_dim(dim), 1), 1) for dim in symbolic_shape]
+    return result
 
 
 def _get_symbolic_shape_and_vector_shapes(
@@ -384,6 +392,10 @@ def partition_ops_with_gpr_offsets(trace: CapturedTrace, constraints: list[Const
                 )
                 reshape.expanded_dims = custom.expanded_dims
                 reshape.vector_shapes = custom.vector_shapes
+                propagate_tag(custom.fx_node, reshape)
+                # Also propagate tag to the underlying Read nodes
+                for op in ops_to_combine:
+                    propagate_tag(custom.fx_node, op)
 
                 # Save the original index on the reshape op so later we can
                 # detect if op was part of `gpr_offset` partition.
@@ -391,6 +403,238 @@ def partition_ops_with_gpr_offsets(trace: CapturedTrace, constraints: list[Const
                 custom.replace_all_uses_with(reshape)
 
             custom.graph.erase_node(custom.fx_node)
+
+
+def merge_contiguous_reads(
+    trace: CapturedTrace, constraints: list[Constraint], target: str
+):
+    """
+    Merge reads that access contiguous physical memory into wider vector loads.
+
+    Runs to a fixed point, doubling the vector width each iteration:
+    ept=1 pairs → ept=2, ept=2 pairs → ept=4, etc. Works regardless of how
+    the reads were created (expansion, manual, etc.).
+
+    Reads are grouped by (memory operand, ept). Within each group, pairs whose
+    physical flat offset starts differ by exactly ept are merged.
+    """
+    hw_constraint = get_hardware_constraint(constraints)
+    while _merge_contiguous_reads_once(trace, hw_constraint):
+        pass
+
+
+def _get_physical_start(
+    custom: Read,
+    symbolic_shape: tuple,
+    symbolic_dims: list,
+) -> dict:
+    """Get the physical start coordinates for a read.
+
+    For reads with a non-identity mapping, applies the mapping to get physical
+    coordinates. For identity-mapped reads (mapping=None), reads the start
+    offsets directly from the index.
+    """
+    from ..utils.mapping_utils import transform_index_on_mapping
+
+    if custom.mapping is not None and not custom.has_identity_mapping():
+        physical = transform_index_on_mapping(
+            custom.mapping, symbolic_shape, custom.index, is_read=True
+        )
+        if not all(dim in physical for dim in symbolic_dims):
+            return None
+        return {dim: physical[dim] for dim in symbolic_dims}
+    if not all(dim in custom.index for dim in symbolic_dims):
+        return None
+    return {dim: custom.index[dim].start for dim in symbolic_dims}
+
+
+def _merge_contiguous_reads_once(trace: CapturedTrace, hw_constraint) -> bool:
+    """Single merge pass: merge adjacent pairs of same-ept reads.
+
+    Groups reads by (memory operand, ept) and merges pairs whose physical
+    flat offset starts differ by exactly ept. Returns True if any merges
+    happened.
+    """
+    from collections import defaultdict
+    from ...compiler.utils import strides_from_symbolic_shape
+    from ..._support.indexing import IndexingContext
+
+    # Group reads by (memory, ept, region).  A new region starts at each
+    # subgraph boundary and whenever a side-effecting op (write, barrier, ...)
+    # is encountered, so we never merge reads across such ops.  Reads with
+    # dynamic mapping values are skipped to keep the merge logic simple.
+    groups: dict[tuple, list[fx.Node]] = defaultdict(list)
+    region_id = 0
+    for subgraph in trace.region_graph.subgraphs.values():
+        region_id += 1
+        for node in subgraph.nodes:
+            custom = get_custom(node)
+            if not isinstance(custom, CustomOp):
+                continue
+            if custom.has_side_effects:
+                region_id += 1
+                continue
+            if not isinstance(custom, Read):
+                continue
+            if custom.mapping_dynamic_vals:
+                continue
+            # Skip reads that have bounds: the merged read would lose the
+            # mapping and source→target index, making mask generation incorrect.
+            if custom.bounds is not None:
+                continue
+            key = (custom.memory, custom.elements_per_thread, region_id)
+            groups[key].append(node)
+
+    idxc = IndexingContext.current()
+    merged_any = False
+
+    for (memory_node, ept, _region), reads in groups.items():
+        if len(reads) < 2:
+            continue
+
+        customs = [(get_custom(n), n) for n in reads]
+        memory = get_custom(memory_node)
+        symbolic_shape = memory.type.symbolic_shape
+        strides = strides_from_symbolic_shape(
+            idxc, symbolic_shape, allow_mixed_shapes=True
+        )
+        symbolic_dims = [infer_dim(d) for d in symbolic_shape]
+
+        read_infos = []
+        for custom, node in customs:
+            phys_start = _get_physical_start(custom, symbolic_shape, symbolic_dims)
+            if phys_start is None:
+                continue
+            flat_offset = sum(
+                phys_start[dim] * stride for dim, stride in zip(symbolic_dims, strides)
+            )
+            read_infos.append((flat_offset, phys_start, custom, node))
+
+        merged = set()
+        for i in range(len(read_infos)):
+            if i in merged:
+                continue
+            for j in range(i + 1, len(read_infos)):
+                if j in merged:
+                    continue
+                off1, phys1, custom1, node1 = read_infos[i]
+                off2, phys2, custom2, node2 = read_infos[j]
+
+                raw_diff = subs_idxc(off2 - off1)
+
+                # For reads with non-identity mappings (e.g. preshuffle
+                # scales), the flat-offset diff contains complex floor/Mod
+                # expressions that sympy.simplify cannot reduce.  Use fast
+                # numeric probing instead.
+                has_complex_mapping = (
+                    custom1.mapping is not None and not custom1.has_identity_mapping()
+                )
+
+                # subs_idxc may fully resolve to a plain int.
+                if isinstance(raw_diff, (int, sympy.Integer)):
+                    diff = int(raw_diff)
+                elif has_complex_mapping:
+                    diff = _numeric_eval_constant(raw_diff)
+                    if diff is None:
+                        continue
+                else:
+                    diff = sym_simplify(raw_diff)
+                    if diff != ept and diff != -ept:
+                        nv = _numeric_eval_constant(raw_diff)
+                        if nv is not None:
+                            diff = nv
+
+                if diff == ept:
+                    lo_phys, hi_phys = phys1, phys2
+                    lo_custom, hi_custom = custom1, custom2
+                    lo_node, hi_node = node1, node2
+                elif diff == -ept:
+                    lo_phys, hi_phys = phys2, phys1
+                    lo_custom, hi_custom = custom2, custom1
+                    lo_node, hi_node = node2, node1
+                else:
+                    continue
+
+                # Find dimension that advances by ept.
+                merge_dim = None
+                for dim in symbolic_dims:
+                    raw_d = subs_idxc(hi_phys[dim] - lo_phys[dim])
+                    if isinstance(raw_d, (int, sympy.Integer)):
+                        d = int(raw_d)
+                    elif has_complex_mapping:
+                        d = _numeric_eval_constant(raw_d)
+                        if d is None:
+                            merge_dim = None
+                            break
+                    else:
+                        d = sym_simplify(raw_d)
+                        if d != ept and d != 0:
+                            nv = _numeric_eval_constant(raw_d)
+                            if nv is not None:
+                                d = nv
+                    if d == ept:
+                        merge_dim = dim
+                    elif not (d == 0):
+                        merge_dim = None
+                        break
+                if merge_dim is None:
+                    continue
+
+                # Respect hardware vector width limit.
+                new_ept = 2 * ept
+                element_type = lo_custom.type.dtype
+                if new_ept > hw_constraint.max_elems_per_load(element_type):
+                    continue
+                with lo_custom.graph.inserting_before(lo_node):
+                    new_index = {
+                        dim: IndexSequence(
+                            lo_phys[dim],
+                            new_ept if dim == merge_dim else 1,
+                            1,
+                        )
+                        for dim in symbolic_dims
+                    }
+
+                    merged_read = Read(
+                        lo_custom.memory,
+                        elements_per_thread=new_ept,
+                        mapping=None,
+                        _write_dependency=lo_custom._write_dependency,
+                        flags=lo_custom.flags,
+                    ).add_to_graph(lo_custom.graph, loc=lo_custom.location)
+                    merged_custom = get_custom(merged_read)
+                    merged_custom.index = new_index
+                    merged_custom.vector_shapes = deepcopy(lo_custom.vector_shapes)
+                    propagate_tag(lo_node, merged_read)
+
+                    extract0 = ExtractSlice(merged_read, [0], [ept], [1]).add_to_graph(
+                        lo_custom.graph, loc=lo_custom.location
+                    )
+                    get_custom(extract0).index = deepcopy(lo_custom.index)
+                    get_custom(extract0).vector_shapes = deepcopy(
+                        lo_custom.vector_shapes
+                    )
+                    propagate_tag(lo_node, extract0)
+
+                    extract1 = ExtractSlice(
+                        merged_read, [ept], [ept], [1]
+                    ).add_to_graph(lo_custom.graph, loc=lo_custom.location)
+                    get_custom(extract1).index = deepcopy(hi_custom.index)
+                    get_custom(extract1).vector_shapes = deepcopy(
+                        hi_custom.vector_shapes
+                    )
+                    propagate_tag(hi_node, extract1)
+
+                lo_custom.replace_all_uses_with(extract0)
+                hi_custom.replace_all_uses_with(extract1)
+                lo_custom.graph.erase_node(lo_node)
+                hi_custom.graph.erase_node(hi_node)
+
+                merged.update({i, j})
+                merged_any = True
+                break
+
+    return merged_any
 
 
 def partition_gather_like_ops(
@@ -501,6 +745,10 @@ def partition_gather_like_ops(
                 )
                 reshape.expanded_dims = custom.expanded_dims
                 reshape.vector_shapes = custom.vector_shapes
+                propagate_tag(custom.fx_node, reshape)
+                # Also propagate tag to the underlying Read nodes
+                for op in ops_to_combine:
+                    propagate_tag(custom.fx_node, op)
 
                 reshape.index = index
                 custom.replace_all_uses_with(reshape)
@@ -508,3 +756,167 @@ def partition_gather_like_ops(
                 raise NotImplementedError(f"Unsupported op type: {custom}")
 
             custom.erase()
+
+
+SubstList = list[tuple[sympy.Symbol, sympy.Expr]]
+
+
+def _get_divisibility_subs(
+    constraints: Sequence[Constraint],
+) -> tuple[SubstList, SubstList]:
+    """Extract divisibility assumptions into forward/backward substitution lists.
+
+    For each ``Assumption(Eq(Mod(S, d), 0))`` we introduce a fresh integer
+    symbol ``S_div_d`` and build:
+      forward:  S  -> d * S_div_d
+      backward: S_div_d -> S / d
+    Applying forward subs lets sympy resolve ``Mod(S, d)`` to 0 and
+    ``floor(S / d)`` to ``S_div_d``, then backward subs restores the
+    original symbols.
+    """
+    forward: list[tuple[sympy.Symbol, sympy.Expr]] = []
+    backward: list[tuple[sympy.Symbol, sympy.Expr]] = []
+    for c in constraints:
+        if not isinstance(c, Assumption):
+            continue
+        expr = c.expr
+        if not isinstance(expr, sympy.Eq):
+            continue
+        lhs, rhs = expr.args
+        # Match Eq(Mod(S, d), 0).
+        if rhs != 0 or not isinstance(lhs, sympy.Mod):
+            continue
+        sym, divisor = lhs.args
+        if not sym.is_Symbol or not divisor.is_Integer:
+            continue
+        # Bail if the symbol may be negative: floor/Mod semantics differ
+        # between Euclidean and truncated division for negative operands.
+        if not sym.is_nonnegative:
+            continue
+        div_sym = sympy.Symbol(
+            f"_{sym.name}_div_{divisor}",
+            integer=True,
+            nonnegative=sym.is_nonnegative,
+            positive=sym.is_positive,
+        )
+        forward.append((sym, divisor * div_sym))
+        backward.append((div_sym, sym / divisor))
+    return forward, backward
+
+
+def _simplify_expr(
+    expr: sympy.Expr,
+    fwd: list[tuple[sympy.Symbol, sympy.Expr]],
+    bwd: list[tuple[sympy.Symbol, sympy.Expr]],
+) -> sympy.Expr:
+    """Run subs_idxc + simplify with divisibility rewriting."""
+    expr = subs_idxc(expr)
+    if fwd:
+        expr = safe_subs(expr, fwd)
+    expr = sym_simplify(expr)
+    if bwd:
+        expr = safe_subs(expr, bwd)
+    return expr
+
+
+def _simplify_symbols_map(
+    mapping: dict,
+    fwd: list,
+    bwd: list,
+) -> tuple[dict, bool]:
+    """Simplify values in a symbol map (``{dim: expr}``).
+
+    Returns ``(new_map, changed)``."""
+    new_map = {}
+    changed = False
+    for key, val in mapping.items():
+        new_val = _simplify_expr(val, fwd, bwd)
+        new_map[key] = new_val
+        if new_val != val:
+            changed = True
+    return new_map, changed
+
+
+def _simplify_mapping(
+    mapping: IndexMapping,
+    fwd: list,
+    bwd: list,
+) -> tuple[IndexMapping, bool]:
+    """Simplify expressions inside an IndexMapping.
+
+    Returns ``(new_mapping, True)`` if any expression changed,
+    ``(original_mapping, False)`` otherwise.
+    """
+    new_inputs, inp_changed = _simplify_symbols_map(mapping.input_mapping, fwd, bwd)
+    new_outputs, out_changed = _simplify_symbols_map(mapping.output_mapping, fwd, bwd)
+    new_dyn_mappings = []
+    dyn_changed = False
+    for dvm in mapping.dynamic_val_mappings or ():
+        new_dvm, c = _simplify_symbols_map(dvm, fwd, bwd)
+        new_dyn_mappings.append(new_dvm)
+        dyn_changed |= c
+    if not (inp_changed or out_changed or dyn_changed):
+        return mapping, False
+    return (
+        IndexMapping(
+            mapping.num_iterators,
+            new_inputs,
+            new_outputs,
+            dynamic_val_mappings=tuple(new_dyn_mappings),
+        ),
+        True,
+    )
+
+
+def simplify_indices(trace: CapturedTrace, constraints: Sequence[Constraint] = ()):
+    """Pre-simplify index expressions on all ops.
+
+    Runs ``simplify(subs_idxc(component))`` on every ``start``, ``size``,
+    and ``stride`` of every ``IndexSequence`` in every op's index dict,
+    and on every expression in Read/Write index mappings.
+
+    Divisibility assumptions (``Assumption(Eq(Mod(S, d), 0))``) are
+    extracted from *constraints* and used to resolve floor/Mod sub-expressions.
+
+    This normalises indices once so downstream passes (contiguity checks,
+    merge, partition) don't each pay the simplification cost independently.
+    """
+    fwd, bwd = _get_divisibility_subs(constraints)
+    for subgraph in trace.region_graph.subgraphs.values():
+        for node in subgraph.nodes:
+            custom = get_custom(node)
+            if not isinstance(custom, CustomOp):
+                continue
+            # Simplify index mappings on Read/Write ops.
+            if isinstance(custom, (Read, Write)) and custom.mapping is not None:
+                new_mapping, mapping_changed = _simplify_mapping(
+                    custom.mapping, fwd, bwd
+                )
+                if mapping_changed:
+                    custom.mapping = new_mapping
+            # Simplify index sequences.
+            try:
+                index = custom.index
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(index, dict):
+                new_index = {}
+                changed = False
+                for dim, seq in index.items():
+                    if not isinstance(seq, IndexSequence):
+                        new_index[dim] = seq
+                        continue
+                    new_start = _simplify_expr(seq.start, fwd, bwd)
+                    new_size = _simplify_expr(seq.size, fwd, bwd)
+                    new_stride = _simplify_expr(seq.stride, fwd, bwd)
+                    if (
+                        new_start != seq.start
+                        or new_size != seq.size
+                        or new_stride != seq.stride
+                    ):
+                        new_index[dim] = IndexSequence(new_start, new_size, new_stride)
+                        changed = True
+                    else:
+                        new_index[dim] = seq
+                if changed:
+                    custom.index = new_index

@@ -14,7 +14,10 @@ import torch.fx as fx
 
 import wave_lang.kernel.lang as tkl
 from wave_lang.kernel._support.dtype import DataType
-from wave_lang.kernel.wave.mlir_converter.mlir_converter import emit_wave_dialect
+from wave_lang.kernel.wave.mlir_converter.mlir_converter import (
+    format_diagnostics,
+    PersistentEmitter,
+)
 from wave_lang.kernel.wave.compile_options import WaveCompileOptions
 from wave_lang.support.logging import get_logger
 
@@ -34,6 +37,7 @@ from ...ops.wave_ops import (
     MMA,
     MMABase,
     MemoryCounterWait,
+    MemoryCounterWaitBarrier,
     NestedRegionOp,
     Output,
     Placeholder,
@@ -50,6 +54,7 @@ from ...ops.wave_ops import (
     Write,
     get_custom,
 )
+from ..utils.tag_utils import propagate_tag
 from ..constraints import (
     Constraint,
     DistributionConstraint,
@@ -227,6 +232,7 @@ def verify_nodes(trace: CapturedTrace, constraints: list[Constraint]):
             custom,
             (
                 MemoryCounterWait,
+                MemoryCounterWaitBarrier,
                 SharedMemoryBarrier,
                 SharedMemoryBarrierSignal,
                 SharedMemoryBarrierWait,
@@ -352,9 +358,14 @@ def set_node_indices_water_checked(
     """
 
     _set_water_id(trace)
-    _, diagnostics, inferred_attributes = emit_wave_dialect(trace, constraints, options)
+    with PersistentEmitter() as emitter:
+        _, diagnostics, inferred_attributes = emitter.emit_wave_dialect(
+            trace, constraints, options
+        )
     if diagnostics:
-        raise RuntimeError(f"Water indices check failed: {diagnostics}")
+        raise RuntimeError(
+            f"Water indices check failed:\n{format_diagnostics(diagnostics, use_color=False)}"
+        )
     set_node_indices(trace, constraints, print_ir_before, print_ir_after)
     _check_water_indices(trace, inferred_attributes)
     _reset_water_id(trace)
@@ -423,12 +434,16 @@ def compute_stride(
     not the given dimension.
     """
     stride = 1
+    target_base_dim = infer_dim(target_dim)
     for dim in reversed(symbolic_shape):
-        if dim == target_dim:
+        base_dim = infer_dim(dim)
+        if base_dim == target_base_dim:
             break
-        assert dim in vector_shapes, f"Dimension {dim} not found in vector shapes"
+        assert (
+            base_dim in vector_shapes
+        ), f"Dimension {dim} (base: {base_dim}) not found in vector shapes"
         # Sanity Check to ensure that the stride is never less than 1.
-        stride *= max(1, vector_shapes[dim])
+        stride *= max(1, vector_shapes[base_dim])
 
     try:
         stride = int(stride)
@@ -445,10 +460,13 @@ def is_contiguous_dim(
     the dimension is the last one in the symbolic shape or all dimensions after it
     are unit dimensions.
     """
-    is_innermost_dim = dim == symbolic_shape[-1]
-    dim_index = symbolic_shape.index(dim)
-    static_shape = [vector_shapes[dim] for dim in symbolic_shape]
-    all_unit_dims = all(dim == 1 for dim in static_shape[dim_index + 1 :])
+    # Normalize dimensions to base symbols for comparison and lookup
+    base_dim = infer_dim(dim)
+    base_symbolic_shape = [infer_dim(d) for d in symbolic_shape]
+    is_innermost_dim = base_dim == base_symbolic_shape[-1]
+    dim_index = base_symbolic_shape.index(base_dim)
+    static_shape = [vector_shapes.get(d, 1) for d in base_symbolic_shape]
+    all_unit_dims = all(d == 1 for d in static_shape[dim_index + 1 :])
     return is_innermost_dim or all_unit_dims
 
 
@@ -963,11 +981,12 @@ def get_reduce_mapping(
         index = {}
 
         dim = custom.dim
+        base_dim = infer_dim(dim)
 
         # Compute the index sequence for the reduction dimension based on the
         # threads per wave and the vector size.
         threads_per_wave = hardware_constraint.threads_per_wave
-        vector_size = hardware_constraint.vector_shapes[dim]
+        vector_size = hardware_constraint.vector_shapes[base_dim]
         assert (
             vector_size % threads_per_wave == 0
         ), f"Vector size {dim}={vector_size} must be divisible by threads per wave {threads_per_wave}"
@@ -1110,6 +1129,7 @@ def create_broadcast(
             to_broadcast.fx_node, target_node.type.symbolic_shape
         ).add_to_graph(op.graph, loc=op.location)
         broadcasted.location = op.location
+        propagate_tag(op.fx_node, broadcasted)
         custom = get_custom(broadcasted)
         custom.vector_shapes = op.vector_shapes
         custom.index = deepcopy(target_node.index)

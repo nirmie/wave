@@ -29,7 +29,9 @@ def WaveElementsPerThreadOpInterface
     when lowering the Wave dialect programming model to the SIMT programming
     model. Each operation may indicate how to infer the elements per threads for
     its results based on the operation itself and the elements per thread values
-    of its operands, and vice versa.
+    of its operands, and vice versa. The trailing `init` object contains common
+    immutable values provided to the analysis, such as the dimension mapped to
+    the workgroup X identifier.
 
     Several common implementations are provided via traits.
   }];
@@ -45,7 +47,8 @@ def WaveElementsPerThreadOpInterface
                :$operandElements,
            "::llvm::MutableArrayRef<::wave::ElementsPerThreadLatticeValue>"
                :$resultElements,
-           "::llvm::raw_ostream &":$errs)
+           "::llvm::raw_ostream &":$errs,
+           "const ::wave::ElementsPerThreadInit &":$init)
     >,
     InterfaceMethod<[{
       Propagate elements per threads information from results to operands.
@@ -58,7 +61,23 @@ def WaveElementsPerThreadOpInterface
                :$operandElements,
            "::llvm::ArrayRef<::wave::ElementsPerThreadLatticeValue>"
                :$resultElements,
-           "::llvm::raw_ostream &":$errs)
+           "::llvm::raw_ostream &":$errs,
+           "const ::wave::ElementsPerThreadInit &":$init)
+    >,
+    InterfaceMethod<[{
+      Initialize elements per thread information for operands of the current
+      operation. By default, they are initialized to lattice bottom and will be
+      updated by the analysis. Certain operations may want to initialize them
+      to specific values based on the operation semantics.
+      }],
+      "::llvm::LogicalResult",
+      "initializeElementsPerThreadBackward",
+      (ins "::llvm::MutableArrayRef<::wave::ElementsPerThreadLatticeValue>"
+               :$operandElements),
+      /*methodBody=*/"",
+      /*defaultImplementation=*/[{
+        return ::llvm::success();
+      }]
     >,
   ];
   let cppNamespace = "::wave";
@@ -71,6 +90,11 @@ def NoOpElementsPerThreadOpTrait
 
 def IdentityElementsPerThreadOpTrait
     : NativeOpTrait<"IdentityElementsPerThreadOpTrait"> {
+  let cppNamespace = "::wave";
+}
+
+def ReductionElementsPerThreadOpTrait
+    : NativeOpTrait<"ReductionElementsPerThreadOpTrait"> {
   let cppNamespace = "::wave";
 }
 
@@ -111,6 +135,15 @@ def WaveInferTypeOpInterface : OpInterface<"WaveInferTypeOpInterface"> {
       (ins "::llvm::MutableArrayRef<::wave::WaveTensorType>":$operandTypes,
            "::llvm::ArrayRef<::wave::WaveTensorType>":$resultTypes,
            "::llvm::raw_ostream &":$errs)
+    >,
+    InterfaceMethod<[{
+      Finalize the type inference on the operation, e.g., by modifying its
+      attributes. This will be called after the value types were updated in
+      place and may be used for additional verification.
+      }],
+      "::llvm::LogicalResult",
+      "finalizeTypeInference",
+      (ins)
     >
   ];
 }
@@ -121,6 +154,11 @@ def IdentityTypeInferenceOpTrait
 }
 
 def NoOpTypeInferenceOpTrait : NativeOpTrait<"NoOpTypeInferenceOpTrait"> {
+  let cppNamespace = "::wave";
+}
+
+def ReductionTypeInferenceOpTrait
+    : NativeOpTrait<"ReductionTypeInferenceOpTrait"> {
   let cppNamespace = "::wave";
 }
 
@@ -135,6 +173,11 @@ def CompatibleOperandsAndResultsOpTrait
 
 def CompatibleOperandsAndResultsIgnoreSpaceOpTrait
     : NativeOpTrait<"CompatibleOperandsAndResultsIgnoreSpaceOpTrait"> {
+  let cppNamespace = "::wave";
+}
+
+def CompatibleOperandsAndResultsShapeOpTrait
+    : NativeOpTrait<"CompatibleOperandsAndResultsShapeOpTrait"> {
   let cppNamespace = "::wave";
 }
 
@@ -228,18 +271,24 @@ def WaveInferIndexExprsOpInterface : OpInterface<"WaveInferIndexExprsOpInterface
       }]
     >,
     InterfaceMethod<[{
-      Set the index attribute of the current operation based on (converged)
-      operand and result index expressions. Even though the index expression is
-      conceptually a property of a value, it is typically attached to the
-      operation producing these values. Some operations may require special
-      handling, e.g., operations with regions that may also want to capture
-      index expressions of their block arguments or certain operations like MMA
-      that also expect operand index expressions for legacy reasons.
+      Populate the argument with the ordered list of values for which the index
+      expressions should be present in the corresponding operation attribute.
+      Return a function producing a user-understandable name of that value. Note
+      that the implementation of the function should be careful not to capture
+      `this` as it is a thin wrapper around `Operation *` that is usually passed
+      by value and is therefore easily out-of-scope. It is preferable to capture
+      specific quantities, such as operand positions, by value directly.
+
+      Even though the index expression is conceptually a property of a value, it
+      is attached to operations for roundtripping and legacy reasons.
       }],
-      "::llvm::LogicalResult",
-      "setIndexFromLattices",
-      (ins "::llvm::ArrayRef<::wave::IndexExprsLatticeStorage>":$operandExprs,
-           "::llvm::ArrayRef<::wave::IndexExprsLatticeStorage>":$resultExprs)
+      "std::function<void(::llvm::raw_ostream &, unsigned)>",
+      "getIndexExprValuesAndDescriptions",
+      (ins "::llvm::SmallVectorImpl<::mlir::Value> &":$values),
+      /*methodBody=*/"",
+      /*defaultImplementation=*/[{
+        return ::wave::detail::defaultGetIndexExprValuesAndDescriptions($_op, values);
+      }]
     >
   ];
 }
@@ -249,8 +298,21 @@ def IdentityIndexExprsOpTrait
   let cppNamespace = "::wave";
 }
 
-def RequiresIndexExprsSidewaysBackwardPropagationOpTrait
-    : NativeOpTrait<"RequiresIndexExprsSidewaysBackwardPropagationOpTrait"> {
+//-----------------------------------------------------------------------------
+// Traits indicating sideways propagation requirements
+//-----------------------------------------------------------------------------
+
+def RequiresSidewaysBackwardPropagationOpTrait
+    : NativeOpTrait<"RequiresSidewaysBackwardPropagationOpTrait"> {
+  let cppNamespace = "::wave";
+}
+
+//-----------------------------------------------------------------------------
+// Reduction operation traits
+//-----------------------------------------------------------------------------
+
+def WaveReductionOpTrait
+    : NativeOpTrait<"WaveReductionOpTrait"> {
   let cppNamespace = "::wave";
 }
 

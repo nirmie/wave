@@ -1,14 +1,23 @@
+import hashlib
+import math
 from dataclasses import dataclass
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Optional, Sequence, TYPE_CHECKING
 import torch.fx as fx
+import sympy
 from ..ops.wave_ops import (
     get_custom,
+    Conditional,
     Read,
     Write,
     Placeholder,
     Iterate,
+    WorkgroupBarrier,
+    NewScalar,
+    Ge,
+    Lt,
 )
-from ..wave.constraints import Constraint
+import wave_lang.kernel.lang as tkl
+from ..wave.constraints import Constraint, HardwareConstraint
 from .base import define_schedule_op
 import logging
 
@@ -18,13 +27,127 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+##############################################################
+# Helper functions
+##############################################################
+
+
+def _get_hardware_constraint(
+    constraints: list[Constraint],
+) -> Optional[HardwareConstraint]:
+    """Get the HardwareConstraint from the constraints list."""
+    for c in constraints:
+        if isinstance(c, HardwareConstraint):
+            return c
+    return None
+
+
+def _get_graph_node(custom, graph: fx.Graph, location) -> fx.Node:
+    """Add a CustomOp to the graph and return its fx.Node."""
+    custom.add_to_graph(graph)
+    custom.location = location
+    return custom.fx_node
+
+
+def _insert_cond_barrier_at(
+    condition: Any,  # sympy.Basic or fx.Node
+    target: Any,
+    kernel_trace: "CapturedTrace",
+    insert_after: bool = False,
+) -> None:
+    """
+    Insert a conditional barrier before or after a target node.
+
+    Args:
+        condition: The condition for the barrier (sympy expression or fx.Node).
+            Example: hw.wave_id >= mid_wave
+        target: The target node (PipelineStageRef, fx.Node, or list)
+        kernel_trace: The kernel trace for adding subgraphs
+        insert_after: If True, insert barrier after target; otherwise before
+    """
+    # Get the target nodes
+    target_nodes = get_nodes_from_ref(target)
+    assert (
+        target_nodes is not None and len(target_nodes) > 0
+    ), "Target must have at least one node"
+
+    # Use first node for 'before', last node for 'after'
+    target_node = target_nodes[-1] if insert_after else target_nodes[0]
+    custom = get_custom(target_node)
+    graph = custom.graph
+    location = custom.location
+
+    # Validate condition type
+    if not isinstance(condition, (sympy.Basic, fx.Node)):
+        raise ValueError(
+            f"Condition must be sympy expression or fx.Node, "
+            f"got {type(condition).__name__}"
+        )
+
+    if insert_after:
+        with graph.inserting_after(target_node):
+            _insert_cond_barrier(condition, kernel_trace, graph, location)
+    else:
+        with graph.inserting_before(target_node):
+            _insert_cond_barrier(condition, kernel_trace, graph, location)
+
+
+def _insert_cond_barrier(
+    condition: Any,  # fx.Node or sympy.Basic
+    trace: "CapturedTrace",
+    graph: fx.Graph,
+    location=None,
+) -> fx.Node:
+    """
+    Insert a conditional workgroup barrier.
+
+    Args:
+        condition: The condition that controls barrier execution.
+            Can be an fx.Node or a sympy expression (IndexExpr).
+            Sympy expressions are passed directly to Conditional.
+        trace: The kernel trace for adding subgraphs
+        graph: The graph to insert the conditional into
+        location: Optional location for debugging
+
+    Returns:
+        The conditional barrier node
+    """
+    barrier_graph = fx.Graph()
+
+    # Generate unique name for the barrier subgraph
+    if isinstance(condition, fx.Node):
+        barrier_graph_name = f"barrier_graph_{condition.name}"
+    else:
+        # For sympy expressions, use a sanitized string representation
+        cond_hash = hashlib.md5(str(condition).encode()).hexdigest()[:8]
+        barrier_graph_name = f"barrier_graph_expr_{cond_hash}"
+
+    # Add barrier inside the conditional subgraph
+    barrier_node = WorkgroupBarrier().add_to_graph(barrier_graph)
+    barrier_node.location = location
+
+    # Create the conditional that wraps the barrier
+    # Conditional accepts both fx.Proxy/fx.Node and IndexExpr (sympy)
+    cond_barrier = Conditional(
+        condition,
+        subgraph_name=barrier_graph_name,
+        implicit_captures=[],
+    ).add_to_graph(graph)
+    cond_barrier.location = location
+
+    barrier_graph.parent_op = cond_barrier
+    trace.add_subgraph(barrier_graph_name, barrier_graph)
+
+    return cond_barrier
+
+
 # Stubs to enable type checking of the custom schedule ops - decorated with @define_op for dispatch
 @define_schedule_op
-def get_node_by_tag(tag: str): ...
+def get_node_by_tag(tag: str | set[str]): ...
 
 
 @define_schedule_op
-def get_node_by_tag_and_type(tag: str, node_type: Any): ...
+def get_node_by_tag_and_type(tag: str | set[str], node_type: Any): ...
 
 
 @define_schedule_op
@@ -60,7 +183,7 @@ def reorder_graph(loop: Any, clusters: Any): ...
 
 
 @define_schedule_op
-def pipeline(iterate: Sequence[fx.Node]): ...
+def pipeline(iterate: Sequence[fx.Node], multi_buffer_count: Optional[int] = None): ...
 
 
 @define_schedule_op
@@ -72,15 +195,37 @@ def stagger(loop: Any): ...
 
 
 @define_schedule_op
+def interleave_ops(
+    base_ops: Any,
+    interleaved_ops: Any,
+    intervals: int | list[int] = 1,
+    start_offsets: int | list[int] | None = None,
+    start_after_groups: list[list[int]] | None = None,
+): ...
+
+
+@define_schedule_op
+def insert_cond_barrier_before(condition: Any, target: Any): ...
+
+
+@define_schedule_op
+def insert_cond_barrier_after(condition: Any, target: Any): ...
+
+
+@define_schedule_op
 def filter_nodes(nodes: Any, subgraph: Any = None, node_type: Any = None): ...
 
 
 @define_schedule_op
-def get_node_by_tag_and_iteration(tag: str, iteration: int): ...
+def get_node_by_tag_and_iteration(tag: str | set[str], iteration: int): ...
 
 
 @define_schedule_op
 def unroll(loop: Any, factor: int): ...
+
+
+@define_schedule_op
+def get_hardware_constraint(): ...
 
 
 def add_op_before(op, subgraph: fx.Graph, anchor: fx.Node, location=None):
@@ -110,18 +255,70 @@ def extract_nodes(item):
     return [item]
 
 
+def interleave_operations(
+    base_ops: list,
+    interleaved_ops: list | list[list],
+    intervals: int | list[int] = 1,
+    start_offsets: int | list[int] | None = None,
+    start_after_groups: list[list[int]] | None = None,
+) -> list:
+    """Interleave operations with flexible per-group patterns."""
+    # Normalize inputs to lists
+    if not isinstance(interleaved_ops[0], list):
+        # Single list of ops
+        interleaved_ops = [interleaved_ops]
+    if isinstance(intervals, int):
+        intervals = [intervals] * len(interleaved_ops)
+    if start_offsets is None:
+        start_offsets = [0] * len(interleaved_ops)
+    elif isinstance(start_offsets, int):
+        start_offsets = [start_offsets] * len(interleaved_ops)
+    if start_after_groups is None:
+        start_after_groups = [[] for _ in interleaved_ops]
+    # Track counters for each group
+    counters = [0] * len(interleaved_ops)
+    result = []
+    for i, base_op in enumerate(base_ops):
+        result.append(base_op)
+        # Check each group for insertion
+        for group_idx, (ops, interval, offset, depends_on) in enumerate(
+            zip(interleaved_ops, intervals, start_offsets, start_after_groups)
+        ):
+            # All dependent groups must be fully exhausted first
+            deps_satisfied = all(
+                counters[dep] >= len(interleaved_ops[dep]) for dep in depends_on
+            )
+            if (
+                deps_satisfied
+                and i >= offset
+                and (i - offset) % interval == 0
+                and counters[group_idx] < len(ops)
+            ):
+                result.append(ops[counters[group_idx]])
+                counters[group_idx] += 1
+    # Add any remaining ops from each group
+    for group_idx, ops in enumerate(interleaved_ops):
+        while counters[group_idx] < len(ops):
+            result.append(ops[counters[group_idx]])
+            counters[group_idx] += 1
+    return result
+
+
 def get_nodes_from_ref(ref):
     """
-    Get the actual nodes from a reference (PipelineStageRef or list).
+    Get the actual nodes from a reference (PipelineStageRef, list, or fx.Node).
     """
     if isinstance(ref, PipelineStageRef):
         # For PipelineStageRef, return the pipelined iterate node directly
         return [ref.pipelined_iterate_node]
+    elif isinstance(ref, fx.Node):
+        # Direct fx.Node - wrap in list
+        return [ref]
     elif isinstance(ref, (list, tuple)):
         # Direct list of nodes
         return list(ref)
     else:
-        raise ValueError(f"Expected PipelineStageRef or list, got {type(ref)}")
+        raise ValueError(f"Expected PipelineStageRef, fx.Node or list, got {type(ref)}")
 
 
 @dataclass
@@ -132,9 +329,31 @@ class PipelineStageRef:
     stage: Any
 
 
-def get_node_by_tag_helper(kernel_trace, tag: str):
+def get_node_by_tag_helper(kernel_trace, tag: str | set[str]):
+    """
+    Get nodes by tag.
+
+    Args:
+        kernel_trace: The kernel trace to search.
+        tag: Either a string or a set of strings.
+            - If a string: matches nodes where the tag is in the node's tag set.
+            - If a set: matches nodes where the node's tag set equals exactly.
+    """
     logger.info(f"Getting node by tag: {tag}")
-    nodes = kernel_trace.walk(lambda x: get_custom(x).tag == tag)
+
+    def matches_tag(node_tag: set[str] | str | None) -> bool:
+        if node_tag is None:
+            return False
+        # Normalize node_tag to a set for comparison
+        node_tag_set = {node_tag} if isinstance(node_tag, str) else node_tag
+        if isinstance(tag, str):
+            # Single string: check if it's in the node's tag set
+            return tag in node_tag_set
+        else:
+            # Set of strings: must match exactly
+            return node_tag_set == tag
+
+    nodes = kernel_trace.walk(lambda x: matches_tag(get_custom(x).tag))
     logger.info(f"Found {len(nodes)} nodes by tag: {tag}")
     return nodes
 
@@ -148,12 +367,16 @@ class CustomScheduleOp:
 
 @dataclass
 class GetNodeByTag(CustomScheduleOp):
-    tag: str
+    tag: str | set[str]
     schedule_op_name = "get_node_by_tag"
 
     @classmethod
     def handle(
-        cls, region_graph, kernel_trace, constraints: list[Constraint], tag: str
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        tag: str | set[str],
     ):
         # Always execute the real logic during tracing to apply scheduling
         real_result = get_node_by_tag_helper(kernel_trace, tag)
@@ -164,7 +387,7 @@ class GetNodeByTag(CustomScheduleOp):
 
 @dataclass
 class GetNodeByTagAndType(CustomScheduleOp):
-    tag: str
+    tag: str | set[str]
     node_type: Any
     schedule_op_name = "get_node_by_tag_and_type"
 
@@ -174,7 +397,7 @@ class GetNodeByTagAndType(CustomScheduleOp):
         region_graph,
         kernel_trace,
         constraints: list[Constraint],
-        tag: str,
+        tag: str | set[str],
         node_type: Any,
     ):
         assert constraints is not None, "Constraints are required"
@@ -213,7 +436,7 @@ class GetNodeByTagAndIteration(CustomScheduleOp):
         List of nodes matching the tag that belong to the specified iteration
     """
 
-    tag: str
+    tag: str | set[str]
     iteration: int
     schedule_op_name = "get_node_by_tag_and_iteration"
 
@@ -223,7 +446,7 @@ class GetNodeByTagAndIteration(CustomScheduleOp):
         region_graph,
         kernel_trace,
         constraints: list[Constraint],
-        tag: str,
+        tag: str | set[str],
         iteration: int,
     ):
         assert constraints is not None, "Constraints are required"
@@ -378,53 +601,123 @@ class ReorderGraph(CustomScheduleOp):
         clusters: Any,
     ):
         from ..wave.schedule_reordering import reorder_graph as reorder_graph_impl
+        from ..wave.scheduling.loop_reconstruction import PipelineStage
 
         # Get the iterate node from the reference (PipelineStageRef or list)
         loop_result = get_nodes_from_ref(loop)
         assert loop_result is not None, "Loop must have a result"
         assert len(loop_result) > 0, "Loop must have at least one element"
 
-        # Get the iterate's subgraph (this will be the KERNEL stage after pipelining)
         iterate_node = loop_result[0]
         custom_iterate = get_custom(iterate_node)
-        subgraph = kernel_trace.get_subgraph(custom_iterate.subgraph_name)
 
         # Extract cluster nodes from proxies
         cluster_nodes = []
-
         assert isinstance(clusters, (list, tuple)), "Clusters must be a list or tuple"
         for item in clusters:
             cluster_nodes.extend(extract_nodes(item))
 
         logger.info(f"Reordering with {len(cluster_nodes)} cluster items")
 
-        # Apply the reordering to the subgraph
+        # Determine target graph based on pipeline stage
+        is_parent_graph_stage = isinstance(loop, PipelineStageRef) and loop.stage in (
+            PipelineStage.EPILOGUE,
+            PipelineStage.PROLOGUE,
+        )
+
+        if is_parent_graph_stage:
+            return cls._reorder_parent_graph(kernel_trace, loop.stage, cluster_nodes)
+        else:
+            return cls._reorder_subgraph(
+                kernel_trace, custom_iterate, cluster_nodes, reorder_graph_impl
+            )
+
+    @classmethod
+    def _reorder_subgraph(
+        cls, kernel_trace, custom_iterate, cluster_nodes, reorder_graph_impl
+    ):
+        """Reorder a named subgraph (KERNEL). Creates a new graph and replaces the old one."""
+        subgraph = kernel_trace.get_subgraph(custom_iterate.subgraph_name)
         reordered_subgraph = reorder_graph_impl(subgraph, cluster_nodes)
 
         if reordered_subgraph is None:
             logger.warning("Failed to reorder graph, skipping reordering")
             return None
 
-        # Replace the old subgraph with the reordered one
         reordered_subgraph.parent_op = subgraph.parent_op
         original_subgraph_name = custom_iterate.subgraph_name
         reordered_subgraph_name = f"reordered_{original_subgraph_name}"
 
-        # Add the new subgraph and update references
         kernel_trace.add_subgraph(reordered_subgraph_name, reordered_subgraph)
         kernel_trace.get_root_graph().subgraphs[
             reordered_subgraph_name
         ] = reordered_subgraph
         custom_iterate.update_arg("subgraph_name", reordered_subgraph_name)
 
-        # Remove the old subgraph
         del kernel_trace.region_graph.subgraphs[original_subgraph_name]
         del kernel_trace.get_root_graph().subgraphs[original_subgraph_name]
 
         logger.info(
             f"Successfully reordered graph: {original_subgraph_name} -> {reordered_subgraph_name}"
         )
+        return None
 
+    @classmethod
+    def _reorder_parent_graph(cls, kernel_trace, stage, cluster_nodes):
+        """Reorder EPILOGUE or PROLOGUE nodes in-place within the root graph.
+
+        Unlike KERNEL reordering (which replaces the entire subgraph), this
+        operates in-place to avoid invalidating node references held by
+        PipelineStageRef and subsequent schedule ops.
+        """
+        from ..wave.utils.general_utils import topological_sort_with_dependencies
+
+        root_graph = kernel_trace.get_root_graph()
+        node_list = list(root_graph.nodes)
+
+        prune_duplicates = lambda x: list(dict.fromkeys(x))
+        unique_cluster_nodes = prune_duplicates(cluster_nodes)
+
+        if not unique_cluster_nodes:
+            logger.warning(f"No cluster nodes for {stage.name}, skipping reordering")
+            return None
+
+        ordered_cluster = sorted(unique_cluster_nodes)
+        earliest_cluster_node = ordered_cluster[0]
+        latest_cluster_node = ordered_cluster[-1]
+
+        pre_cluster_nodes = [x for x in node_list if x < earliest_cluster_node]
+        post_cluster_nodes = [x for x in node_list if x > latest_cluster_node]
+        exhaustive_cluster_nodes = [
+            x
+            for x in node_list
+            if x >= earliest_cluster_node and x <= latest_cluster_node
+        ]
+
+        reordered_nodes = topological_sort_with_dependencies(
+            unique_cluster_nodes, exhaustive_cluster_nodes, pre_cluster_nodes
+        )
+
+        total = len(pre_cluster_nodes) + len(reordered_nodes) + len(post_cluster_nodes)
+        if len(node_list) != total:
+            logger.warning(
+                f"Failed to reorder {stage.name}: node count mismatch "
+                f"({len(node_list)} vs {total})"
+            )
+            return None
+
+        # Move the cluster-region nodes in-place to match the desired order.
+        # pre_cluster_nodes and post_cluster_nodes stay where they are.
+        anchor = pre_cluster_nodes[-1] if pre_cluster_nodes else None
+        for node in reordered_nodes:
+            if anchor is not None:
+                anchor.append(node)
+            anchor = node
+
+        logger.info(
+            f"Successfully reordered {stage.name} in-place "
+            f"({len(reordered_nodes)} nodes)"
+        )
         return None
 
 
@@ -508,10 +801,12 @@ class PipelinedLoop:
         iterate: Sequence[fx.Node],
         kernel_trace: "CapturedTrace",
         constraints: list[Constraint],
+        multi_buffer_count: Optional[int] = None,
     ):
         self.iterate = iterate
         self.kernel_trace = kernel_trace
         self.constraints = constraints
+        self.multi_buffer_count = multi_buffer_count
 
         # Access options from the current ScheduleContext
         from .._support.tracing import ScheduleContext
@@ -576,7 +871,7 @@ class PipelinedLoop:
             initiation_interval=self.initiation_interval,
             scheduling_type=SchedulingType.MANUAL,
             visualize=False,
-            multi_buffer_count=None,
+            multi_buffer_count=self.multi_buffer_count,
         )
 
         # Store the pipelined iterate node and node mapping, then create proxies for the stages
@@ -821,7 +1116,87 @@ class Pipeline(CustomScheduleOp):
 
 @dataclass
 class Stagger(CustomScheduleOp):
+    """
+    Simple stagger scheduling that inserts wave barriers around a loop.
+
+    This places:
+    - wave_hi barrier BEFORE the loop (blocks high waves so low waves start first)
+    - wave_lo barrier AFTER the loop (blocks low waves so high waves catch up)
+
+    For finer control, use insert_cond_barrier_before/after with your own conditions.
+
+    Example creating custom conditions:
+        hw = tkw.get_hardware_constraint()
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        wave_hi = hw.wave_id >= mid_wave
+        wave_lo = hw.wave_id < mid_wave
+        tkw.insert_cond_barrier_before(wave_hi, loop)
+        tkw.insert_cond_barrier_after(wave_lo, loop)
+    """
+
     schedule_op_name = "stagger"
+
+    @classmethod
+    def handle(
+        cls, region_graph, kernel_trace, constraints: list[Constraint], loop: Any
+    ):
+        # Get hardware constraint to compute wave conditions
+        hw = _get_hardware_constraint(constraints)
+        if hw is None:
+            raise ValueError("Stagger requires HardwareConstraint")
+
+        # Compute mid-wave for 2-way stagger
+        flat_wave_count = math.prod(hw.waves_per_block)
+        assert flat_wave_count % 2 == 0, f"Wave count {flat_wave_count} must be even"
+        mid_wave = flat_wave_count // 2
+
+        # Create conditions using sympy expressions (just like kernel code!)
+
+        # Compute wave_id from hardware constraint
+        flat_id = hw.linearized_thread_id
+        wave_id = flat_id // hw.threads_per_wave
+
+        # Get the target node to access graph and location
+        target_nodes = get_nodes_from_ref(loop)
+        assert target_nodes is not None and len(target_nodes) > 0
+        target_node = target_nodes[0]
+        custom = get_custom(target_node)
+        graph = custom.graph
+        location = custom.location
+
+        # Create typed scalar nodes for i32 comparison
+        with graph.inserting_before(target_node):
+            mid_wave_reg = _get_graph_node(
+                NewScalar(mid_wave, tkl.i32), graph, location
+            )
+            wave_id_reg = _get_graph_node(NewScalar(wave_id, tkl.i32), graph, location)
+            is_wave_hi = _get_graph_node(Ge(wave_id_reg, mid_wave_reg), graph, location)
+            is_wave_lo = _get_graph_node(Lt(wave_id_reg, mid_wave_reg), graph, location)
+
+        # Insert conditional barriers using the typed fx.Node conditions
+        with graph.inserting_before(target_node):
+            _insert_cond_barrier(is_wave_hi, kernel_trace, graph, location)
+        with graph.inserting_after(target_nodes[-1]):
+            _insert_cond_barrier(is_wave_lo, kernel_trace, graph, location)
+
+        logger.info("Applied 2-way stagger scheduling to loop")
+        return None
+
+
+@dataclass
+class InsertConditionalBarrierBefore(CustomScheduleOp):
+    """
+    Insert a conditional barrier before a target node.
+
+    Usage:
+        # Get hardware constraint and create condition
+        hw = tkw.get_hardware_constraint()
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        condition = hw.wave_id >= mid_wave
+        tkw.insert_cond_barrier_before(condition, loop)
+    """
+
+    schedule_op_name = "insert_cond_barrier_before"
 
     @classmethod
     def handle(
@@ -829,47 +1204,48 @@ class Stagger(CustomScheduleOp):
         region_graph,
         kernel_trace,
         constraints: list[Constraint],
-        loop: Any,
+        condition: Any,
+        target: Any,
     ):
-        """
-        Implements stagger scheduling by adding conditional barriers around a loop that blocks waves such that
-        waves execute clusters in a staggered manner for better overlap of computation and memory access.
+        if not isinstance(condition, (sympy.Basic, fx.Node)):
+            raise ValueError(
+                f"condition must be sympy expression or fx.Node, "
+                f"got {type(condition).__name__}"
+            )
+        _insert_cond_barrier_at(condition, target, kernel_trace, insert_after=False)
+        return None
 
-        For 2 waves (default):
-        at T0:
-           wave 0 runs cluster 0
-           wave 1 blocked
-        at T1:
-           wave 0 runs cluster 1
-           wave 1 runs cluster 0
-        at T2:
-           wave 0 runs cluster 2
-           wave 1 runs cluster 1
 
-        This pattern continues, allowing N waves to execute clusters in parallel with a stagger offset.
-        """
-        from ..wave.schedule_reordering import add_conditional_barriers_to_loop
-        from ..wave.utils.general_utils import get_hardware_constraint
+@dataclass
+class InsertConditionalBarrierAfter(CustomScheduleOp):
+    """
+    Insert a conditional barrier after a target node.
 
-        # Get the iterate node from the reference (PipelineStageRef or list)
-        loop_result = get_nodes_from_ref(loop)
-        assert loop_result is not None, "Loop must have a result"
-        assert len(loop_result) > 0, "Loop must have at least one element"
+    Usage:
+        # Get hardware constraint and create condition
+        hw = tkw.get_hardware_constraint()
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        condition = hw.wave_id < mid_wave
+        tkw.insert_cond_barrier_after(condition, loop)
+    """
 
-        iterate_node = loop_result[0]
-        custom_iterate = get_custom(iterate_node)
+    schedule_op_name = "insert_cond_barrier_after"
 
-        # Get hardware constraints
-        hardware_constraint = get_hardware_constraint(constraints)
-        if hardware_constraint is None:
-            raise ValueError("Stagger requires HardwareConstraint")
-
-        add_conditional_barriers_to_loop(
-            custom_iterate, kernel_trace, hardware_constraint
-        )
-
-        logger.info(f"Applied 2-way stagger scheduling to loop")
-
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+        condition: Any,
+        target: Any,
+    ):
+        if not isinstance(condition, (sympy.Basic, fx.Node)):
+            raise ValueError(
+                f"condition must be sympy expression or fx.Node, "
+                f"got {type(condition).__name__}"
+            )
+        _insert_cond_barrier_at(condition, target, kernel_trace, insert_after=True)
         return None
 
 
@@ -1179,3 +1555,48 @@ class Unroll(CustomScheduleOp):
         )
 
         return None
+
+
+@dataclass
+class GetHardwareConstraint(CustomScheduleOp):
+    """
+    Get the HardwareConstraint from the kernel constraints.
+
+    This allows creating custom wave conditions in schedules, consistent with
+    how conditions work in kernel code.
+
+    Usage in a schedule:
+        hw = tkw.get_hardware_constraint()
+
+        # Create wave stagger conditions
+        mid_wave = math.prod(hw.waves_per_block) // 2
+        wave_hi = hw.wave_id >= mid_wave
+        wave_lo = hw.wave_id < mid_wave
+
+        tkw.insert_cond_barrier_before(wave_hi, loop)
+        tkw.insert_cond_barrier_after(wave_lo, loop)
+
+    Returns:
+        The HardwareConstraint object which provides:
+        - wave_id: sympy expression for the current wave ID
+        - waves_per_block: tuple of wave counts per dimension
+        - threads_per_wave: number of threads per wave
+        - And other hardware-specific information
+    """
+
+    schedule_op_name = "get_hardware_constraint"
+
+    @classmethod
+    def handle(
+        cls,
+        region_graph,
+        kernel_trace,
+        constraints: list[Constraint],
+    ):
+        hw = _get_hardware_constraint(constraints)
+        if hw is None:
+            raise ValueError(
+                "No HardwareConstraint found in constraints. "
+                "Make sure your kernel has a HardwareConstraint defined."
+            )
+        return hw

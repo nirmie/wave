@@ -43,7 +43,7 @@ def get_wave_compile_options(
         BLOCK_M: 16,
         BLOCK_N: 16,
         BLOCK_K: 16,
-        ADDRESS_SPACE: tkl.AddressSpace.SHARED_MEMORY.value,
+        ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
     }
     bindings.update(additional_symbols)
 
@@ -81,7 +81,7 @@ def test_read_write():
         tkw.write(res, b)
 
     options = get_wave_compile_options(canonicalize=True)
-    # Compile to AMDGCN assembly (for lit tests, no amdclang++)
+    # Compile to AMDGCN assembly (for lit tests, no clang++).
     options.compile_to_asm = True
 
     read_write = wave_compile(options, read_write)
@@ -173,7 +173,7 @@ def test_mma():
         canonicalize=True,
         compile_to_mlir=True,
     )
-    # Compile to AMDGCN assembly (for lit tests, no amdclang++)
+    # Compile to AMDGCN assembly (for lit tests, no clang++).
     compile_options.compile_to_asm = True
     mma = wave_compile(compile_options, mma)
     print(mma.asm)
@@ -276,7 +276,7 @@ def test_mma_16x16x32():
         canonicalize=True,
         compile_to_mlir=True,
     )
-    # Compile to AMDGCN assembly (for lit tests, no amdclang++)
+    # Compile to AMDGCN assembly (for lit tests, no clang++).
     compile_options.compile_to_asm = True
     mma_16x16x32 = wave_compile(compile_options, mma_16x16x32)
     print(mma_16x16x32.asm)
@@ -378,7 +378,7 @@ def test_mma_multi_workgroup_multi_wave():
         canonicalize=True,
         compile_to_mlir=True,
     )
-    # Compile to AMDGCN assembly (for lit tests, no amdclang++)
+    # Compile to AMDGCN assembly (for lit tests, no clang++).
     compile_options.compile_to_asm = True
     mma_multi = wave_compile(compile_options, mma_multi)
     print(mma_multi.asm)
@@ -568,10 +568,6 @@ def test_gemm_gather_to_lds():
     # CHECK:          loop_0_exit:
     # CHECK:          buffer_store_dword
     # CHECK:          s_endpgm
-
-
-SHARED_ADDRESS_SPACE = tkl.AddressSpace.SHARED_MEMORY.value
-GLOBAL_ADDRESS_SPACE = tkl.AddressSpace.GLOBAL_MEMORY.value
 
 
 @run_test

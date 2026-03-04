@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "water/Dialect/Wave/Transforms/LoweringPatterns.h"
+#include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Value.h"
 #include "water/Dialect/Wave/IR/WaveAttrs.h"
@@ -20,6 +23,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "water/Dialect/Wave/IR/WaveOps.h"
@@ -241,12 +245,14 @@ public:
 
 void wave::populateWaveBinaryOpLoweringPatterns(
     WaveTypeConverter &typeConverter, RewritePatternSet &patterns) {
-  patterns
-      .add<BinaryOpLoweringPattern<wave::AddOp, arith::AddFOp, arith::AddIOp>,
-           BinaryOpLoweringPattern<wave::SubOp, arith::SubFOp, arith::SubIOp>,
-           BinaryOpLoweringPattern<wave::MulOp, arith::MulFOp, arith::MulIOp>,
-           BinaryOpLoweringPattern<wave::DivOp, arith::DivFOp, arith::DivSIOp>>(
-          typeConverter, patterns.getContext());
+  patterns.add<
+      BinaryOpLoweringPattern<wave::AddOp, arith::AddFOp, arith::AddIOp>,
+      BinaryOpLoweringPattern<wave::SubOp, arith::SubFOp, arith::SubIOp>,
+      BinaryOpLoweringPattern<wave::MulOp, arith::MulFOp, arith::MulIOp>,
+      BinaryOpLoweringPattern<wave::DivOp, arith::DivFOp, arith::DivSIOp>,
+      BinaryOpLoweringPattern<wave::MaxOp, arith::MaximumFOp, arith::MaxSIOp>,
+      BinaryOpLoweringPattern<wave::MinOp, arith::MinimumFOp, arith::MinSIOp>>(
+      typeConverter, patterns.getContext());
 }
 
 //===----------------------------------------------------------------------===//
@@ -379,6 +385,254 @@ public:
     return success();
   }
 };
+
+//===----------------------------------------------------------------------===//
+// SelectOp
+//===----------------------------------------------------------------------===//
+
+class SelectOpLoweringPattern : public OpConversionPattern<wave::SelectOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(wave::SelectOp op, wave::SelectOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto arithSelectOp =
+        arith::SelectOp::create(rewriter, op.getLoc(), adaptor.getCondition(),
+                                adaptor.getLhs(), adaptor.getRhs());
+    rewriter.replaceOp(op, arithSelectOp);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// ApplyExprOp
+//===----------------------------------------------------------------------===//
+
+// Visit affine expressions. Unlike upstream, this takes a target type and is
+// capable of producing vector opreations operating on non-index types.
+class AffineExprExpander : public AffineExprVisitor<AffineExprExpander, Value> {
+public:
+  // Initialize the expander to create operations with the specified result type
+  // using the given builder and location. Symbols, operands and hyperparameters
+  // are used to construct operands; hyperamareters are expected to contain all
+  // named symbols and operands are expected to have at least as many entries as
+  // the last indexed operand present in the symbols list. The expression is not
+  // expected to use any dimensions. Addition and multiplication operations are
+  // constructed with the specified fastmath flags.
+  AffineExprExpander(OpBuilder &builder, Location loc, Type targetType,
+                     ArrayRef<Attribute> symbols, ArrayRef<Value> operands,
+                     wave::WaveHyperparameterAttr hypeparameters,
+                     arith::IntegerOverflowFlags overflowFlags)
+      : AffineExprVisitor<AffineExprExpander, Value>(), builder(builder),
+        loc(loc), symbols(symbols), operands(operands),
+        hypeparameters(hypeparameters), targetType(targetType),
+        overflowFlags(overflowFlags) {}
+
+  // Build a (splat) constant matching the target type.
+  Value getConstant(int64_t value) {
+    Type elementType = targetType;
+    auto shapedType = dyn_cast<ShapedType>(targetType);
+    if (shapedType) {
+      elementType = shapedType.getElementType();
+    }
+
+    // Go through APInt since ElementsAttr complains about wrong bitwidth if
+    // int64_t is given for any elemental type other than i64.
+    APInt apValue(elementType.getIntOrFloatBitWidth(), value,
+                  /*isSigned=*/true);
+    if (shapedType) {
+      return arith::ConstantOp::create(
+          builder, loc, SplatElementsAttr::get(shapedType, apValue));
+    } else {
+      return arith::ConstantIntOp::create(builder, loc, targetType, apValue);
+    }
+  }
+
+  // Create a constant.
+  Value visitConstantExpr(AffineConstantExpr expr) {
+    return getConstant(expr.getValue());
+  }
+
+  // Create an add operation.
+  Value visitAddExpr(AffineBinaryOpExpr expr) {
+    Value lhs = visit(expr.getLHS());
+    Value rhs = visit(expr.getRHS());
+    return arith::AddIOp::create(builder, loc, lhs, rhs, overflowFlags);
+  }
+
+  // Create a mul operation.
+  Value visitMulExpr(AffineBinaryOpExpr expr) {
+    Value lhs = visit(expr.getLHS());
+    Value rhs = visit(expr.getRHS());
+    return arith::MulIOp::create(builder, loc, lhs, rhs, overflowFlags);
+  }
+
+  // Create a flooring division operation.
+  Value visitFloorDivExpr(AffineBinaryOpExpr expr) {
+    Value lhs = visit(expr.getLHS());
+    Value rhs = visit(expr.getRHS());
+    return arith::FloorDivSIOp::create(builder, loc, lhs, rhs);
+  }
+
+  // Create a ceiling division operation.
+  Value visitCeilDivExpr(AffineBinaryOpExpr expr) {
+    Value lhs = visit(expr.getLHS());
+    Value rhs = visit(expr.getRHS());
+    return arith::CeilDivSIOp::create(builder, loc, lhs, rhs);
+  }
+
+  // Create a modulo operation.
+  Value visitModExpr(AffineBinaryOpExpr expr) {
+    Value lhs = visit(expr.getLHS());
+    Value rhs = visit(expr.getRHS());
+    return arith::RemSIOp::create(builder, loc, lhs, rhs);
+  }
+
+  // Operand symbols are taken from the operand list, named symbols are treated
+  // as constants and expected to be present in hyperparameters.
+  Value visitSymbolExpr(AffineSymbolExpr expr) {
+    if (auto operandAttr =
+            dyn_cast<wave::WaveOperandAttr>(symbols[expr.getPosition()])) {
+      return operands[operandAttr.getOperandNumber()];
+    } else if (auto symbolAttr = dyn_cast<wave::WaveSymbolAttr>(
+                   symbols[expr.getPosition()])) {
+      std::optional<int64_t> value =
+          hypeparameters.getSymbolValue(symbolAttr.getName());
+      assert(value && "failed to get symbol value");
+      return getConstant(*value);
+    }
+    llvm_unreachable("unsupported symbol kind");
+  }
+
+  Value visitDimExpr(AffineDimExpr) {
+    llvm_unreachable("dims are not supported");
+  }
+
+private:
+  OpBuilder &builder;
+  Location loc;
+  ArrayRef<Attribute> symbols;
+  ArrayRef<Value> operands;
+  wave::WaveHyperparameterAttr hypeparameters;
+  Type targetType;
+  arith::IntegerOverflowFlags overflowFlags;
+};
+
+class ApplyExprOpLoweringPattern
+    : public OpConversionPattern<wave::ApplyExprOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(wave::ApplyExprOp op, wave::ApplyExprOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    wave::WaveExprListAttr exprListAttr = op.getExpr();
+    AffineMap map = exprListAttr.getMap();
+    ArrayRef<Attribute> symbols = exprListAttr.getSymbols();
+    SmallVector<Value> operands = adaptor.getOperands();
+
+    const auto *typeConverter =
+        static_cast<const wave::WaveTypeConverter *>(getTypeConverter());
+    auto convertedType = dyn_cast_or_null<VectorType>(
+        typeConverter->convertType(op.getResult().getType()));
+    if (!convertedType)
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+
+    SmallVector<Value> results;
+    for (AffineExpr expr : map.getResults()) {
+      AffineExprExpander expander(rewriter, op.getLoc(), convertedType, symbols,
+                                  operands, typeConverter->getHyperparameters(),
+                                  arith::IntegerOverflowFlags::nsw |
+                                      arith::IntegerOverflowFlags::nuw);
+      results.push_back(expander.visit(expr));
+      assert(results.back() && "failed to expand affine expression");
+    }
+
+    if (!op.getCombinator().has_value()) {
+      assert(results.size() == 1 &&
+             "expected a single result in absence of a combinator");
+      rewriter.replaceOp(op, results[0]);
+      return success();
+    }
+
+    wave::WaveApplyExprCombinator combinator = *op.getCombinator();
+    if (llvm::is_contained({wave::WaveApplyExprCombinator::Maximum,
+                            wave::WaveApplyExprCombinator::Minimum},
+                           combinator)) {
+      assert(results.size() >= 1 &&
+             "expected at least one result for min/max combinator");
+      Value running = results[0];
+      for (size_t i = 1, e = results.size(); i < e; ++i) {
+        if (combinator == wave::WaveApplyExprCombinator::Maximum) {
+          running = arith::MaxSIOp::create(rewriter, op.getLoc(), running,
+                                           results[i]);
+        } else {
+          running = arith::MinSIOp::create(rewriter, op.getLoc(), running,
+                                           results[i]);
+        }
+      }
+      rewriter.replaceOp(op, running);
+      return success();
+    }
+
+    assert(results.size() == 2 &&
+           "expected exactly two results for comparison combinator");
+    arith::CmpIPredicate predicate = [&] {
+      switch (combinator) {
+      case wave::WaveApplyExprCombinator::Greater:
+        return arith::CmpIPredicate::sgt;
+      case wave::WaveApplyExprCombinator::Less:
+        return arith::CmpIPredicate::slt;
+      case wave::WaveApplyExprCombinator::Equal:
+        return arith::CmpIPredicate::eq;
+      case wave::WaveApplyExprCombinator::NotEqual:
+        return arith::CmpIPredicate::ne;
+      case wave::WaveApplyExprCombinator::GreaterOrEqual:
+        return arith::CmpIPredicate::sge;
+      case wave::WaveApplyExprCombinator::LessOrEqual:
+        return arith::CmpIPredicate::sle;
+      default:
+        llvm_unreachable("unsupported comparison combinator");
+      }
+    }();
+    Value result = arith::CmpIOp::create(rewriter, op.getLoc(), predicate,
+                                         results[0], results[1]);
+    Type elementType = wave::getElementType(convertedType);
+    if (!elementType.isInteger(1)) {
+      result =
+          arith::ExtUIOp::create(rewriter, op.getLoc(), convertedType, result);
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class BroadcastOpLoweringPattern
+    : public OpConversionPattern<wave::BroadcastOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(wave::BroadcastOp op, wave::BroadcastOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Broadcast operates on registers, those should have been converted to
+    // vectors now.
+    auto sourceType = cast<VectorType>(adaptor.getSource().getType());
+    auto targetType = cast<VectorType>(op.getResult().getType());
+    if (sourceType == targetType) {
+      rewriter.replaceOp(op, adaptor.getSource());
+      return success();
+    }
+    auto vectorBroadcast = vector::BroadcastOp::create(
+        rewriter, op.getLoc(), targetType, adaptor.getSource());
+    rewriter.replaceOp(op, vectorBroadcast);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// CastOp
+//===----------------------------------------------------------------------===//
 
 class CastOpLoweringPattern : public OpConversionPattern<wave::CastOp> {
 public:
@@ -538,6 +792,127 @@ public:
         ArrayRef<int64_t>(*strideValues));
     rewriter.replaceOp(op, extractOp);
 
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// SelfIndexOp
+//===----------------------------------------------------------------------===//
+
+/// Lowers `wave.self_index` to arithmetic on index vectors.
+/// Computes: start + iota(size) * stride, where start, size and stride come
+/// from the index mapping for the specified dimension.
+class SelfIndexOpLoweringPattern
+    : public OpConversionPattern<wave::SelfIndexOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(wave::SelfIndexOp op, wave::SelfIndexOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    Type convertedType =
+        getTypeConverter()->convertType(op.getResult().getType());
+    if (!convertedType)
+      return rewriter.notifyMatchFailure(op, "type conversion failed");
+
+    auto resultVectorType = dyn_cast<VectorType>(convertedType);
+    if (!resultVectorType)
+      return rewriter.notifyMatchFailure(op, "expected vector result type");
+
+    auto *waveTypeConverter =
+        static_cast<const wave::WaveTypeConverter *>(getTypeConverter());
+    wave::WaveHyperparameterAttr hyper =
+        waveTypeConverter->getHyperparameters();
+
+    ArrayAttr indexArr = op.getIndexAttr();
+    if (!indexArr || indexArr.empty())
+      return rewriter.notifyMatchFailure(op,
+                                         "missing or empty index attribute");
+    DictionaryAttr indexDict = cast<DictionaryAttr>(indexArr[0]);
+
+    // Look up the index mapping for the specified dimension.
+    StringRef dimName = op.getDim().getName();
+    Attribute mappingAttr = indexDict.get(dimName);
+    if (!mappingAttr)
+      return rewriter.notifyMatchFailure(
+          op, "index mapping not found for dimension '" + dimName + "'");
+    auto mapping = cast<wave::WaveIndexMappingAttr>(mappingAttr);
+
+    // Materialize the start expression.
+    FailureOr<SmallVector<Value>> startValues = wave::materializeAffine(
+        loc, mapping.getSymbols(), mapping.getStart(), rewriter, hyper);
+    if (failed(startValues))
+      return rewriter.notifyMatchFailure(
+          op, "failed to materialize start expression");
+    assert(llvm::hasSingleElement(*startValues));
+    Value start = (*startValues)[0];
+
+    // Evaluate the step (number of elements) from hyperparameters.
+    std::optional<SmallVector<int64_t>> stepValues =
+        wave::evaluateMapWithHyperparams(mapping.getStep(),
+                                         mapping.getSymbols(), hyper);
+    if (!stepValues)
+      return rewriter.notifyMatchFailure(
+          op, "failed to evaluate step to a constant");
+    assert(stepValues->size() == 1 && "expected single-result map");
+    int64_t size = (*stepValues)[0];
+
+    // Evaluate the stride from hyperparameters.
+    std::optional<SmallVector<int64_t>> strideValues =
+        wave::evaluateMapWithHyperparams(mapping.getStride(),
+                                         mapping.getSymbols(), hyper);
+    if (!strideValues || strideValues->size() != 1)
+      return rewriter.notifyMatchFailure(
+          op, "failed to evaluate stride to a constant");
+    int64_t stride = (*strideValues)[0];
+
+    // Build iota vector [0, 1, ..., size-1] of index type.
+    IndexType indexType = rewriter.getIndexType();
+    VectorType iotaVectorType = VectorType::get({size}, indexType);
+    Value iota = vector::StepOp::create(rewriter, loc, iotaVectorType);
+
+    Value startVec =
+        vector::BroadcastOp::create(rewriter, loc, iotaVectorType, start);
+
+    Value result;
+    if (stride == 1) {
+      result = arith::AddIOp::create(rewriter, loc, startVec, iota);
+    } else {
+      Value strideVal = arith::ConstantIndexOp::create(rewriter, loc, stride);
+      Value strideVec =
+          vector::BroadcastOp::create(rewriter, loc, iotaVectorType, strideVal);
+      Value iotaScaled = arith::MulIOp::create(rewriter, loc, iota, strideVec);
+      result = arith::AddIOp::create(rewriter, loc, startVec, iotaScaled);
+    }
+
+    rewriter.replaceOpWithNewOp<arith::IndexCastOp>(op, resultVectorType,
+                                                    result);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// PermuteOp
+//===----------------------------------------------------------------------===//
+
+/// Lowers `wave.permute` by replacing it with its operand.
+/// The permute operation is a semantic marker that affects index expression
+/// transformation during compilation. At lowering time, the underlying data
+/// representation remains unchanged.
+class PermuteOpLoweringPattern : public OpConversionPattern<wave::PermuteOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(wave::PermuteOp op, wave::PermuteOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Permute is a pass-through operation at lowering time.
+    // The index expression transformation is handled separately during
+    // the index inference pass.
+    rewriter.replaceOp(op, adaptor.getValue());
     return success();
   }
 };
@@ -755,14 +1130,113 @@ public:
   }
 };
 
+class ReshapeOpLoweringPattern : public OpConversionPattern<wave::ReshapeOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(wave::ReshapeOp op, wave::ReshapeOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!llvm::all_of(adaptor.getSource().getType(), [](Type type) {
+          return type.isSignlessIntOrIndexOrFloat() || isa<VectorType>(type);
+        })) {
+      return rewriter.notifyMatchFailure(
+          op, "expected all source operands to be vectors or scalars");
+    }
+
+    if (adaptor.getSource().size() != 1) {
+      // The verifier checks that all operand types match.
+      Type operandType = adaptor.getSource()[0].getType();
+      bool operandTypeIsScalar = operandType.isIntOrIndexOrFloat();
+      VectorType operandVectorType = dyn_cast<VectorType>(operandType);
+      if (operandTypeIsScalar ||
+          (operandVectorType && operandVectorType.getNumElements() == 1)) {
+        SmallVector<Value> individualValues;
+        for (Value source : adaptor.getSource()) {
+          if (operandTypeIsScalar) {
+            individualValues.push_back(source);
+          } else {
+            individualValues.push_back(
+                vector::ExtractOp::create(rewriter, op.getLoc(), source, 0));
+          }
+        }
+        Value full = vector::FromElementsOp::create(
+            rewriter, op.getLoc(), op.getResult().getType(), individualValues);
+        rewriter.replaceOp(op, full);
+        return success();
+      }
+
+      auto convertedType = cast<VectorType>(
+          getTypeConverter()->convertType(op.getResult().getType()));
+      auto zeros = [&] {
+        if (auto intType =
+                dyn_cast<IntegerType>(convertedType.getElementType())) {
+          return SplatElementsAttr::get(convertedType,
+                                        APInt(intType.getWidth(), 0));
+        } else if (auto floatType =
+                       dyn_cast<FloatType>(convertedType.getElementType())) {
+          return SplatElementsAttr::get(
+              convertedType, APFloat(floatType.getFloatSemantics(), 0));
+        } else {
+          llvm_unreachable("unsupported element type");
+        }
+      }();
+      // TODO: consider using `vector.shuffle` for concatenation. For now being
+      // consistent with pywave.
+      Value concatenated =
+          arith::ConstantOp::create(rewriter, op.getLoc(), zeros);
+      for (auto [i, source] : llvm::enumerate(adaptor.getSource())) {
+        concatenated = vector::InsertStridedSliceOp::create(
+            rewriter, op.getLoc(), source, concatenated,
+            /*offsets=*/i * operandVectorType.getNumElements(), /*strides=*/1);
+      }
+      rewriter.replaceOp(op, concatenated);
+      return success();
+    }
+
+    // Split case: extract a slice from a single operand.
+    auto targetType = cast<VectorType>(
+        getTypeConverter()->convertType(op.getResult().getType()));
+    assert(static_cast<uint64_t>(targetType.getNumElements()) ==
+               static_cast<uint64_t>(
+                   cast<VectorType>(adaptor.getSource()[0].getType())
+                       .getNumElements()) /
+                   op.getNumSlices() &&
+           "vector size mismatch");
+    if ((cast<VectorType>(adaptor.getSource()[0].getType()).getNumElements() %
+         op.getNumSlices()) != 0) {
+      return rewriter.notifyMatchFailure(op,
+                                         "imperfectly divisible vector size");
+    }
+    Value extracted = vector::ExtractStridedSliceOp::create(
+        rewriter, op.getLoc(), adaptor.getSource()[0],
+        /*offsets=*/op.getLogicalSlice() * targetType.getNumElements(),
+        /*sizes=*/targetType.getNumElements(), /*strides=*/1);
+    rewriter.replaceOp(op, extracted);
+    return success();
+  }
+};
+
 } // namespace
 
 void wave::populateWaveMiscellaneousOpsLoweringPatterns(
     WaveTypeConverter &typeConverter, RewritePatternSet &patterns) {
-  patterns.add<CastOpLoweringPattern, ExtractOpLoweringPattern,
-               ExtractSliceOpLoweringPattern, IterateOpLoweringPattern,
-               RegisterOpLoweringPattern, ShuffleOpLoweringPattern>(
-      typeConverter, patterns.getContext());
+  patterns.add<
+      // clang-format off
+      ApplyExprOpLoweringPattern,
+      BroadcastOpLoweringPattern,
+      CastOpLoweringPattern,
+      ExtractOpLoweringPattern,
+      ExtractSliceOpLoweringPattern,
+      IterateOpLoweringPattern,
+      PermuteOpLoweringPattern,
+      RegisterOpLoweringPattern,
+      ReshapeOpLoweringPattern,
+      SelectOpLoweringPattern,
+      SelfIndexOpLoweringPattern,
+      ShuffleOpLoweringPattern
+      // clang-format on
+      >(typeConverter, patterns.getContext());
 }
 
 //===----------------------------------------------------------------------===//
@@ -817,4 +1291,117 @@ public:
 void wave::populateWaveMmaLoweringPatterns(WaveTypeConverter &typeConverter,
                                            RewritePatternSet &patterns) {
   patterns.add<MmaOpLoweringPattern>(typeConverter, patterns.getContext());
+}
+
+//===----------------------------------------------------------------------===//
+// Reduction ops (SumOp, MaxElementOp)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Convert vector::CombiningKind to gpu::AllReduceOperation.
+constexpr gpu::AllReduceOperation
+combiningKindToAllReduceOp(vector::CombiningKind kind) {
+  switch (kind) {
+  case vector::CombiningKind::ADD:
+    return gpu::AllReduceOperation::ADD;
+  case vector::CombiningKind::MAXIMUMF:
+    return gpu::AllReduceOperation::MAXIMUMF;
+  default:
+    llvm_unreachable("unsupported reduction kind");
+  }
+}
+
+/// Emit a warning if the block reduction setting is inconsistent with the
+/// hardware constraint's waves_per_block.
+static void warnIfReductionScopeMismatch(Operation *op, bool isBlockReduction) {
+  func::FuncOp parentFunc = op->getParentOfType<func::FuncOp>();
+  if (!parentFunc)
+    return;
+  ArrayAttr constraints = parentFunc->getAttrOfType<ArrayAttr>(
+      wave::WaveDialect::kWaveConstraintsAttrName);
+  if (!constraints)
+    return;
+  for (Attribute constraint : constraints) {
+    auto hwConstraint =
+        llvm::dyn_cast<wave::HardwareConstraintAttr>(constraint);
+    if (!hwConstraint)
+      continue;
+    ArrayRef<unsigned> wavesPerBlock = hwConstraint.getWavesPerBlock();
+    unsigned totalWaves = 1;
+    for (unsigned w : wavesPerBlock)
+      totalWaves *= w;
+    if (isBlockReduction && totalWaves == 1) {
+      op->emitWarning()
+          << "block reduction requested but hardware constraint "
+             "specifies only one wave per block (waves_per_block = ["
+          << wavesPerBlock[0] << ", " << wavesPerBlock[1] << ", "
+          << wavesPerBlock[2]
+          << "]); consider using wave-level reduction instead";
+    } else if (!isBlockReduction && totalWaves > 1) {
+      op->emitWarning()
+          << "wave-level reduction requested but hardware constraint "
+             "specifies multiple waves per block (waves_per_block = ["
+          << wavesPerBlock[0] << ", " << wavesPerBlock[1] << ", "
+          << wavesPerBlock[2]
+          << "]); consider using block reduction to reduce across all waves";
+    }
+    return;
+  }
+}
+
+template <typename WaveOp, vector::CombiningKind Kind>
+class ReductionOpLoweringPattern : public OpConversionPattern<WaveOp> {
+public:
+  using OpConversionPattern<WaveOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(WaveOp op, typename WaveOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    static_assert(Kind == vector::CombiningKind::ADD ||
+                      Kind == vector::CombiningKind::MAXIMUMF,
+                  "unsupported reduction kind");
+    // Expect PropagateElementsPerThread pass to have run, converting
+    // WaveTensorType results to VectorType.
+    Location loc = op.getLoc();
+
+    Value input = adaptor.getInput();
+    Value init = adaptor.getInit();
+    bool isBlockReduction = op.getScope() == wave::WaveReductionScope::Block;
+
+    // Warn if reduction scope is inconsistent with hardware constraints.
+    warnIfReductionScopeMismatch(op, isBlockReduction);
+
+    Value initElement = vector::ExtractOp::create(rewriter, loc, init, 0);
+    Value threadReduce =
+        vector::ReductionOp::create(rewriter, loc, Kind, input, initElement);
+
+    constexpr gpu::AllReduceOperation gpuReduceOp =
+        combiningKindToAllReduceOp(Kind);
+
+    Value result;
+    if (isBlockReduction) {
+      auto opAttr =
+          gpu::AllReduceOperationAttr::get(rewriter.getContext(), gpuReduceOp);
+      result =
+          gpu::AllReduceOp::create(rewriter, loc, threadReduce, opAttr, false);
+    } else {
+      result = gpu::SubgroupReduceOp::create(rewriter, loc, threadReduce,
+                                             gpuReduceOp, false);
+    }
+    rewriter.replaceOp(op, result);
+
+    return success();
+  }
+};
+
+} // namespace
+
+void wave::populateWaveReductionOpLoweringPatterns(
+    WaveTypeConverter &typeConverter, RewritePatternSet &patterns) {
+  patterns
+      .add<ReductionOpLoweringPattern<wave::SumOp, vector::CombiningKind::ADD>,
+           ReductionOpLoweringPattern<wave::MaxElementOp,
+                                      vector::CombiningKind::MAXIMUMF>>(
+          typeConverter, patterns.getContext());
 }

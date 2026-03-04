@@ -43,7 +43,7 @@ def get_wave_compile_options(
         BLOCK_M: 16,
         BLOCK_N: 16,
         BLOCK_K: 16,
-        ADDRESS_SPACE: tkl.AddressSpace.SHARED_MEMORY.value,
+        ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
     }
     bindings.update(additional_symbols)
 
@@ -87,21 +87,20 @@ def test_read_write():
         tkw.write(res, b)
 
     read_write = wave_compile(get_wave_compile_options(canonicalize=True), read_write)
+    with open("read_write.mlir", "w") as f:
+        f.write(read_write.asm)
     print(read_write.asm)
 
     # CHECK-LABEL:    test_read_write
-    # CHECK-DAG:        #[[MAP0:.*]] = affine_map<()[s0] -> (s0 - (s0 floordiv 64) * 48)>
     # CHECK:          gpu.module @gpu_module
     # CHECK:          gpu.func @read_write
     # CHECK-SAME:       (%[[D0:.*]]: memref<f16> {llvm.inreg}, %[[D1:.*]]: memref<f16> {llvm.inreg})
     # CHECK-SAME:       kernel attributes {known_block_size = array<i32: 64, 1, 1>}
-    # CHECK-DAG:        %[[C0:.*]] = arith.constant 0 : index
     # CHECK:            %[[thread_id_x:.*]] = gpu.thread_id  x
-    # CHECK:            %[[S0:.*]] = memref.reinterpret_cast %[[D0]] to offset: [0], sizes: [16, 16], strides: [16, 1] : memref<f16> to memref<16x16xf16, strided<[16, 1]>>
-    # CHECK:            %[[S1:.*]] = memref.reinterpret_cast %[[D1]] to offset: [0], sizes: [16, 16], strides: [16, 1] : memref<f16> to memref<16x16xf16, strided<[16, 1]>>
-    # CHECK:            %[[I0:.*]] = affine.apply #[[MAP0]]()[%[[thread_id_x]]]
-    # CHECK:            %[[V:.*]] = vector.load %[[S0]][%[[I0]], %[[C0]]] : memref<16x16xf16, strided<[16, 1]>>, vector<16xf16>
-    # CHECK:            vector.store %[[V]], %[[S1]][%[[I0]], %[[C0]]] : memref<16x16xf16, strided<[16, 1]>>, vector<16xf16>
+    # CHECK:            memref.reinterpret_cast %[[D0]] to offset: [0], sizes: [16, 16], strides: [16, 1] : memref<f16> to memref<16x16xf16, strided<[16, 1]>>
+    # CHECK:            vector.load {{.*}} : memref<16x16xf16, strided<[16, 1]>>, vector<16xf16>
+    # CHECK:            memref.reinterpret_cast %[[D1]] to offset: [0], sizes: [{{.*}}], strides: [1] : memref<f16> to memref<{{.*}}xf16, strided<[1]>>
+    # CHECK:            vector.store {{.*}} : memref<{{.*}}xf16, strided<[1]>>, vector<16xf16>
     # CHECK:            return
 
     # CHECK-LABEL:    func.func @isolated_benchmark
@@ -188,4 +187,44 @@ def test_dynamic_symbols():
     # CHECK:            %[[BUF2:.*]] = call @wave_get_buffer(%[[ARG2]]) : (!llvm.ptr) -> memref<?xi8>
     # CHECK:            %[[VIEW2:.*]] = memref.view %[[BUF2]][%[[C0]]][] : memref<?xi8> to memref<f16>
     # CHECK:            gpu.launch_func @gpu_module::@read_write blocks in (%[[BLOCK_M]], %[[BLOCK_N]], %[[C1]]) threads in (%[[C64]], %[[C1]], %[[C1]]) args(%[[VIEW1]] : memref<f16>, %[[VIEW2]] : memref<f16>, %[[DIM0]] : index, %[[DIM1]] : index)
+    # CHECK:            return
+
+
+@run_test
+def test_cluster_dims():
+    constraints: list[tkw.Constraint] = [
+        tkw.HardwareConstraint(
+            threads_per_wave=64,
+            vector_shapes={M: 16, N: 16},
+            workgroups_per_cluster=(2, 2, 1),
+        )
+    ]
+    constraints += [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
+    constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
+    constraints += [tkw.WaveConstraint(M, BLOCK_M)]
+    constraints += [tkw.WaveConstraint(N, BLOCK_N)]
+
+    @tkw.wave(constraints)
+    def read_write(
+        a: tkl.Memory[M, N, ADDRESS_SPACE, tkl.f16],
+        b: tkl.Memory[M, N, ADDRESS_SPACE, tkl.f16],
+    ):
+        res = tkw.read(a)
+        tkw.write(res, b)
+
+    read_write = wave_compile(get_wave_compile_options(canonicalize=True), read_write)
+    print(read_write.asm)
+
+    # CHECK-LABEL:    test_cluster_dims
+    # CHECK:          gpu.func @read_write
+    # CHECK-SAME:       kernel attributes {known_block_size = array<i32: 64, 1, 1>}
+
+    # CHECK-LABEL:    func.func @isolated_benchmark
+    # CHECK-DAG:        %[[C1:.*]] = arith.constant 1 : index
+    # CHECK-DAG:        %[[C2:.*]] = arith.constant 2 : index
+    # CHECK-DAG:        %[[C64:.*]] = arith.constant 64 : index
+    # CHECK:            gpu.launch_func @gpu_module::@read_write
+    # CHECK-SAME:         clusters in (%[[C2]], %[[C2]], %[[C1]])
+    # CHECK-SAME:         blocks in (%[[C1]], %[[C1]], %[[C1]])
+    # CHECK-SAME:         threads in (%[[C64]], %[[C1]], %[[C1]])
     # CHECK:            return

@@ -91,14 +91,14 @@ buildStartIndices(Location loc, DictionaryAttr indexDict,
 ///                  bound_d(elements_per_thread))
 ///          foreach d in dimensions.
 ///
-/// whenever a bounds dictionary is provided. When it is not provided, return a
+/// whenever a bounds mapping is provided. When it is not provided, return a
 /// null mask. If the vectorized dimension cannot be identified, return failure.
 static FailureOr<Value>
-buildMask(Location loc, wave::WaveReadWriteBoundsAttr boundsDict,
+buildMask(Location loc, wave::WaveSymbolMappingAttr boundsMapping,
           ArrayRef<wave::WaveSymbolAttr> orderedSyms, PatternRewriter &rewriter,
           DictionaryAttr indexDict, wave::WaveHyperparameterAttr hyper,
           ArrayRef<Value> startIdx, int64_t elementsPerThread) {
-  if (!boundsDict)
+  if (!boundsMapping)
     return Value();
 
   const uint64_t rank = startIdx.size();
@@ -107,13 +107,15 @@ buildMask(Location loc, wave::WaveReadWriteBoundsAttr boundsDict,
   IntegerType i1Type = IntegerType::get(rewriter.getContext(), 1);
   VectorType maskType = VectorType::get({elementsPerThread}, i1Type);
 
-  // finalMask is the AND of per-dimension bound checks.
+  // finalMask is the AND of per-dimension bound checks. The bounds dict may
+  // be sparse: only dimensions that require masking have an entry. Dimensions
+  // without an entry are fully in-bounds and are skipped.
   Value finalMask;
   for (uint64_t d = 0; d < rank; ++d) {
-    StringRef name = orderedSyms[d].getName();
-    Attribute a = boundsDict.getMapping().get(name);
-    assert(a && "bounds dict missing entry for dimension symbol");
-    auto boundAttr = cast<wave::WaveExprListAttr>(a);
+    auto boundAttr =
+        boundsMapping.lookup<wave::WaveExprListAttr>(orderedSyms[d]);
+    if (!boundAttr)
+      continue;
     // Materialize bounds.
     FailureOr<SmallVector<Value>> boundValsFo = wave::materializeAffine(
         loc, boundAttr.getSymbols(), boundAttr.getMap(), rewriter, hyper);
@@ -309,7 +311,7 @@ createMemoryIndicesAndMask(ConversionPatternRewriter &rewriter,
                            Type memoryTypeArg, VectorType vectorType) {
   int64_t elementsPerThread = vectorType.getNumElements();
 
-  wave::WaveReadWriteBoundsAttr boundsDict = op.getBoundsAttr();
+  wave::WaveSymbolMappingAttr boundsMapping = op.getBoundsAttr();
   wave::WaveHyperparameterAttr hyper =
       static_cast<const wave::WaveTypeConverter &>(*typeConverter)
           .getHyperparameters();
@@ -363,7 +365,7 @@ createMemoryIndicesAndMask(ConversionPatternRewriter &rewriter,
   SmallVector<Value> startIndices = std::move(*maybeStartIndices);
 
   FailureOr<Value> mask =
-      buildMask(op->getLoc(), boundsDict, orderedSyms, rewriter, indexDict,
+      buildMask(op->getLoc(), boundsMapping, orderedSyms, rewriter, indexDict,
                 hyper, startIndices, elementsPerThread);
   if (failed(mask))
     return rewriter.notifyMatchFailure(op, "couldn't build the required mask");
@@ -378,13 +380,16 @@ public:
   LogicalResult
   matchAndRewrite(wave::ReadOp op, wave::ReadOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Expect PropagateElementsPerThread pass to have run, converting
-    // WaveTensorType results to VectorType.
+    if (op.getMapping())
+      return rewriter.notifyMatchFailure(op, "mapping is not supported yet");
+
+    // wave.read produces a register-resident value. PropagateElementsPerThread
+    // converts these from WaveTensorType<register> to VectorType. The
+    // MemoryOnlyTypes normal form (required by LowerWaveToMLIR) verifies that
+    // no WaveTensorType<register> remains, ensuring VectorType is used.
     auto vectorType = dyn_cast<VectorType>(op.getResult().getType());
-    if (!vectorType)
-      return rewriter.notifyMatchFailure(
-          op, "expected vector result type (PropagateElementsPerThread pass "
-              "should have run first)");
+    assert(vectorType && "expected VectorType result; "
+                         "PropagateElementsPerThread may not have run");
     FailureOr<MemAccessInfo> memInfo = createMemoryIndicesAndMask(
         rewriter, getTypeConverter(), op, op.getMemory().getType(), vectorType);
     if (failed(memInfo))
@@ -405,13 +410,17 @@ public:
   LogicalResult
   matchAndRewrite(wave::WriteOp op, wave::WriteOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Expect PropagateElementsPerThread pass to have run, converting
-    // WaveTensorType operands to VectorType.
-    auto vecType = dyn_cast<VectorType>(op.getValueToStore().getType());
-    if (!vecType)
-      return rewriter.notifyMatchFailure(
-          op, "expected vector operand type (PropagateElementsPerThread pass "
-              "should have run first)");
+    if (op.getMapping())
+      return rewriter.notifyMatchFailure(op, "mapping is not supported yet");
+
+    // wave.write consumes a register-resident value. PropagateElementsPerThread
+    // converts these from WaveTensorType<register> to VectorType. The
+    // MemoryOnlyTypes normal form (required by LowerWaveToMLIR) verifies that
+    // no WaveTensorType<register> remains, ensuring VectorType is used.
+    Value vec = adaptor.getValueToStore();
+    auto vecType = dyn_cast<VectorType>(vec.getType());
+    assert(vecType && "expected VectorType operand; PropagateElementsPerThread "
+                      "may not have run");
 
     FailureOr<MemAccessInfo> memInfo = createMemoryIndicesAndMask(
         rewriter, getTypeConverter(), op, op.getMemory().getType(), vecType);
@@ -419,8 +428,8 @@ public:
       return failure();
 
     buildVectorWrite(op.getLoc(), rewriter, adaptor.getMemory(),
-                     memInfo->startIndices, adaptor.getValueToStore(),
-                     memInfo->mask, memInfo->vectorizedDim);
+                     memInfo->startIndices, vec, memInfo->mask,
+                     memInfo->vectorizedDim);
     rewriter.eraseOp(op);
     return success();
   }

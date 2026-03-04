@@ -21,6 +21,7 @@ from ..wave.constraints import (
     MMAOperand,
     MMAType,
 )
+from ..wave.utils.tag_utils import propagate_tag
 
 VMMA_TO_NATIVE_MAP = {
     MMAType.F32_16x16x32_K8_F16: MMAType.F32_16x16x16_F16,
@@ -132,20 +133,24 @@ def decompose_vmma_ops(
         for i in range(unrollKFactor):
             # Emitting ReshapeOp for slicing
             with mma_op.graph.inserting_before(mma_op.fx_node):
-                slice_lhs = Reshape([mma_op.lhs], virtual_vector_shapes).add_to_graph(
-                    mma_op.graph, loc=mma_op.location
-                )
-                slice_rhs = Reshape([mma_op.rhs], virtual_vector_shapes).add_to_graph(
-                    mma_op.graph, loc=mma_op.location
-                )
+                slice_lhs = Reshape(
+                    [mma_op.lhs],
+                    virtual_vector_shapes,
+                    logical_slice=i,
+                    num_slices=unrollKFactor,
+                ).add_to_graph(mma_op.graph, loc=mma_op.location)
+                slice_rhs = Reshape(
+                    [mma_op.rhs],
+                    virtual_vector_shapes,
+                    logical_slice=i,
+                    num_slices=unrollKFactor,
+                ).add_to_graph(mma_op.graph, loc=mma_op.location)
+                propagate_tag(mma_op.fx_node, slice_lhs)
+                propagate_tag(mma_op.fx_node, slice_rhs)
 
             # Setting vector_shapes for num_partitions
             slice_lhs.vector_shapes = native_vector_shapes
             slice_rhs.vector_shapes = native_vector_shapes
-
-            # Setting offset
-            slice_lhs.expanded_dims = {innermost_dim: i}
-            slice_rhs.expanded_dims = {innermost_dim: i}
 
             # Generate new MMA
             vmma_expr = hardware_constraint.mma_index_offset(mma_type)
